@@ -1,0 +1,2270 @@
+Strataco Invoice Automation — Release Notes
+============================================
+
+Newest entries on top. Each version corresponds to the value in `VERSION`.
+Bump the version on every meaningful change before committing.
+
+Versioning: MAJOR.MINOR.PATCH
+  - PATCH  — bug fixes, log/text tweaks, no behaviour change
+  - MINOR  — new feature, new step, new tunable knob, backwards-compatible
+  - MAJOR  — breaking change to file paths, .env keys, or step contracts
+
+
+---------------------------------------------------------------------------
+0.12.1  —  2026-05-13  —  Codex review follow-ups on the 0.12.0 stamp flatten
+---------------------------------------------------------------------------
+
+Codex adversarial review of 0.12.0 surfaced seven findings. This release
+addresses six of them; the seventh (viewer-specific saves with /AP but no
+/V) is deferred because Acrobat and Acrobat Reader — the operator's
+tools — both populate /V on save.
+
+Fixes:
+
+  A. **Vendor /AcroForm now survives intake.** 0.12.0's
+     `_merge_overlay_onto_page_one` flattened the base PDF's AcroForm
+     before merging any new stamp overlay. That was a latent regression:
+     a vendor sending a fillable invoice would have their form stripped
+     on intake (Step 1 / Step 3), making it unfillable for the manager
+     or AP. The flatten call has been removed from the merge path
+     entirely. Step 1 and Step 3 now leave vendor forms intact.
+
+     The orphan-widget bug the intake flatten was masking is fixed
+     directly: new helper `_register_existing_widgets_in_acroform()`
+     promotes any widget annotations on the merged page into the
+     writer's freshly-created `/AcroForm/Fields`, so vendor and prior-
+     stage widgets stay registered (and fillable in all viewers).
+
+  B. **Step 5 now flattens explicitly before the Paid stamp.** Moved
+     out of the merge helper and into `steps/step_5_to_ap.py` directly.
+     The manager-filled Received-stamp values (and any vendor /AcroForm
+     fields the manager touched) get baked as static text BEFORE the
+     editable Paid stamp is added. By the time the AP sees the file,
+     the manager's data is locked.
+
+     If `flatten_acroform` raises, the source stays in the manager's
+     `Approved/` for the next run rather than being saved unflattened.
+
+  C. **Step 6 fails closed on flatten error (Codex #3).** 0.12.0's
+     `_archive_one` fell back to writing the unflattened bytes if
+     `flatten_acroform` raised, AND still deleted the AP source —
+     producing a permanent archive with editable widgets and no
+     recovery path. Now an exception surfaces as a `paid_failed` entry
+     in the morning email, the archive is not written, and the AP
+     source stays in place for the next run.
+
+  D. **Ledger gains `archive_sha256` (Codex #4).** Step 6's flatten
+     changes the on-disk byte hash, so `tools/dup_reconcile.py` —
+     which hashes archived files and looks them up by SHA — used to
+     report every flattened archive as an orphan. Added an
+     `archive_sha256` column to the duplicate ledger. Step 6 computes
+     the post-flatten hash and stores it alongside the chain SHA.
+     `dup_reconcile` now matches against either column. Pre-0.12.1
+     CSVs parse cleanly via the same migration pattern as 0.11.2's
+     `need_review` column.
+
+  E. **`extract_paid_stamp_values` corrections (Codex #5, #6, #7):**
+
+       * Authoritative AcroForm tier: when `/V` returns any non-empty
+         value, the function short-circuits. Partial fills (one paid_*
+         set, the other empty) no longer fall through to positioned
+         text — that fallback could otherwise grab a vendor "Date:"
+         or "Check Number:" by mistake. The caller honestly reports
+         the missing field and the operator fills it.
+       * Image-only detection now scopes to page 1 only. A rasterised
+         page 1 + text-bearing page 2 (the actual shape of the VR 115
+         test invoice) is correctly flagged as `image_only`.
+       * Regex fallback also scopes to page 1 via the new
+         `extract_page_text(pdf_bytes, 0)` helper in
+         `tools/_lib/pdf_text.py`. A remittance stub or terms page
+         later in the document with "PAID — Check Number: …" no
+         longer leaks into the regex match.
+
+Tests:
+
+  `tests/test_stamp_read.py` — eight new cases, all passing:
+
+    1. `vendor_acroform_survives_intake` — Strataco stamp widgets and
+       vendor `vendor_email` widget both editable after intake; no
+       flatten.
+    2. `step5_flatten_locks_vendor_and_received` — manager-filled
+       vendor field AND Strataco fields baked as text after the
+       explicit Step 5 flatten; only Paid widgets editable.
+    3. `step6_fails_closed_on_flatten_error` — monkeypatch
+       `flatten_acroform` to raise, run `_archive_one`, assert the
+       file is flagged paid_failed, source not deleted, no archive
+       written.
+    4. `archive_sha256_round_trip` — chain SHA and archive SHA differ,
+       both persist through the ledger.
+    5. `dup_reconcile_via_archive_sha` — orphan check uses both SHA
+       indexes.
+    6. `multipage_image_only` — 2-page PDF (rasterised page 1 + text
+       page 2) flags as `image_only`.
+    7. `partial_acroform_fail_closed` — `paid_check_number_*` filled,
+       `paid_date_*` empty: returns the check number, empty date,
+       NO positional fallback.
+    8. `multipage_regex_no_false_positive` — page-2 "PAID — Check
+       Number: 99999999" does not leak into the regex fallback.
+
+  Existing 0.12.0 test (`acroform_round_trip`) updated to model the
+  new Step 5 flow (explicit `flatten_acroform` before `render_paid_stamp`).
+
+Deferred:
+
+  * **Codex #2** — viewer-specific saves where the typed value lives
+    in widget `/AP` but `/V` is missing/stale. Acrobat and Acrobat
+    Reader both set `/V` on save; the realistic exposure is a
+    third-party / mobile / online viewer that the operator isn't
+    expected to use. Re-evaluate if a real case appears in the field.
+
+Recovery for any in-flight invoice damaged by 0.12.0:
+
+  Any invoice that went through Step 5 between the 0.12.0 ship and the
+  0.12.1 ship had its Received-stamp values stripped by the now-removed
+  intake flatten. The pre-Step-5 manager-filled bytes are preserved as
+  `Users/<Manager>/Invoices/Approved/Processed - <name>.pdf`. To
+  recover one: drop the `Processed - ` prefix to restore the original
+  filename, re-run Step 5. The 0.12.1 flow flattens correctly.
+
+
+---------------------------------------------------------------------------
+0.12.0  —  2026-05-13  —  Stamp flatten via pikepdf; AcroForm-direct read in Step 6
+---------------------------------------------------------------------------
+
+End-to-end test of the pipeline turned up two layered bugs around the
+Received / Paid stamps, both fixed here. The operator-facing change is the
+simplest part: there is no longer a "Print → Save as PDF to flatten" step.
+The AP fills the Paid stamp in Acrobat, hits Ctrl+S, drags the file into
+Paid_Invoices/. Step 6 reads the values straight from the AcroForm and
+flattens automatically on archive.
+
+Background:
+
+  * Bug 1 — Step 6 couldn't read Microsoft Print-to-PDF output. On a
+    Windows machine, "Print → Save as PDF" rasterises any form-bearing
+    page into JPEG strips. The resulting PDF has zero extractable text
+    and no /AcroForm, so the positioned-text extractor returned empty
+    and the file landed in `paid_failed` with the generic "Could not
+    read Check Number" message.
+
+  * Bug 2 — Step 5 was silently dropping the manager's Received-stamp
+    values. `tools/_lib/stamp.py::_merge_overlay_onto_page_one` used
+    `PdfWriter().append_pages_from_reader(base)` which copies pages but
+    not the document-level /AcroForm. `_ensure_acroform` then created a
+    fresh empty AcroForm and `_migrate_widget_annotations` only added
+    the new overlay's widgets. The base PDF's Received-stamp widgets
+    orphaned out of /AcroForm/Fields. Reproduced in isolation: a
+    manager-filled PDF with 5 Received-stamp fields became a 2-field
+    Paid-only PDF after `render_paid_stamp`.
+
+  * Workflow problem — both `HANDOFF.md` and
+    `workflows/step_6_paid_archive.md` told operators to "Print → Save
+    as PDF" to flatten. On Windows that is Microsoft Print to PDF (= Bug
+    1). The operator was correctly following written instructions.
+
+Fixes:
+
+  A. **New `pikepdf` dependency for reliable text-preserving flattening.**
+     `requirements.txt` adds `pikepdf` (wraps QPDF). pypdf is unchanged
+     for everything else. `tools/_lib/stamp.py::flatten_acroform(bytes)`
+     calls `generate_appearance_streams()` + `flatten_annotations(mode='all')`
+     to bake each widget's /V into the page content stream and strip the
+     widget annotations. Returns the original bytes unchanged when the
+     PDF has no AcroForm (so Step 1 / Step 3 paths on fresh vendor PDFs
+     are unaffected).
+
+  B. **Step 5 flattens the Received stamp before adding the Paid stamp.**
+     `_merge_overlay_onto_page_one` now calls `flatten_acroform` on the
+     base PDF first. The manager's Received-stamp values become static
+     text on the page, the widget-orphan bug stops mattering (the base
+     has no widgets to lose), and the new Paid-stamp overlay adds the
+     only AcroForm fields in the result. AP sees a PDF where Received
+     values are visible-but-not-editable and only the Paid Date + Check
+     Number fields are editable.
+
+  C. **Step 6 reads AcroForm /V directly, then flattens the archive.**
+     `tools/_lib/stamp_read.py::extract_paid_stamp_values` is now tiered:
+       1. AcroForm read — pypdf `get_fields()` for `paid_check_number_*`
+          and `paid_date_*`. Normal happy path for the 0.12.0 flow.
+       2. Positioned text in the PAID region — unchanged, covers PDFs
+          that have been flattened by a text-preserving tool (Acrobat
+          Pro Flatten Form Fields, Kofax, prior pipeline runs).
+       3. Regex over the full text — unchanged.
+     `steps/step_6_paid_archive.py::_archive_one` calls `flatten_acroform`
+     on the AP-folder bytes before `safe_write_unique` to the archive.
+     The archived copy in `Strata_Plans/<plan>/` has zero editable
+     fields. The `Processed - <name>.pdf` marker in the AP folder keeps
+     the original (unflattened) bytes so the operator can re-open and
+     verify in Acrobat if needed.
+
+  D. **Clearer error for image-only PDFs.** `PaidStampValues` gains an
+     `image_only` flag, set when AcroForm is absent AND `extract_full_text`
+     returns "". Step 6 surfaces this as a dedicated paid_failed reason:
+     "PDF appears image-only (likely Microsoft 'Print to PDF') — re-save
+     by just hitting Ctrl+S, do not flatten manually". Previously these
+     PDFs got the generic "Could not read Check Number" message.
+
+  E. **Workflow docs updated.** `workflows/step_6_paid_archive.md` and
+     `HANDOFF.md:57` drop the "Print → Save as PDF" instruction; the new
+     wording is "fill in the form fields, save with Ctrl+S, drag to
+     Paid_Invoices — Step 6 flattens automatically on archive."
+
+Tests:
+
+  `tests/test_stamp_read.py` — two new cases:
+
+    1. `_check_acroform_round_trip` — end-to-end with no shortcut:
+         * `render_received_stamp` on a synthetic invoice
+         * fill Received fields via pikepdf (simulates Acrobat Save-As)
+         * `render_paid_stamp` (which now flattens Received first)
+         * assert Received values are static text, only 2 paid_* fields
+           remain as editable widgets
+         * fill Paid fields via pikepdf (simulates AP Save-As)
+         * `extract_paid_stamp_values` returns the AP-typed values via
+           the new AcroForm tier; `image_only` is False
+         * `flatten_acroform` on the AP-filled PDF → zero editable fields
+           in the archive; every value (Received + Paid) is extractable
+           as static text
+
+    2. `_check_image_only_detection` — synthesises an image-only PDF
+       (JPEG XObject + content stream, no /AcroForm, no text) and asserts
+       `extract_paid_stamp_values(...).image_only` is True.
+
+  The existing reportlab-flatten cases still pass — they exercise the
+  positioned-text fallback path.
+
+Recovery for any invoice that Step 5 already stripped pre-0.12.0:
+
+  Each `Users/<Manager>/Invoices/Approved/Processed - <name>.pdf` holds
+  the pre-merge manager-filled bytes (saved by Step 5 BEFORE the
+  destructive merge — these are not flat, they still have the Received
+  stamp's /V values intact). To recover one:
+    1. Delete the stripped copy from the AP's Approved_Invoices/.
+    2. Rename the `Processed - <name>.pdf` to drop the prefix.
+    3. Re-run Step 5 — Step 5 now flattens the Received fields properly
+       and the AP gets a correctly-stamped PDF.
+
+  Done as a manual operator step; no scripted backfill.
+
+
+---------------------------------------------------------------------------
+0.11.3  —  2026-05-13  —  Codex review follow-ups on the 0.11.2 Step 1 work
+---------------------------------------------------------------------------
+Codex adversarial review of 0.11.2 returned verdict DO-NOT-SHIP with one
+blocker and four risks. Full review filed at
+`codex-router-out/2026-05-13-step1-0.11.2-review/codex-review.md`. User
+triaged each finding; this release addresses findings 1, 3, 4, and 5.
+Findings 2 (real PDF discarded on weak Graph metadata) and 6
+(`_process_prior_attachments` PDF-only filter) were explicitly accepted
+as-is for now.
+
+Fixes:
+
+  A. **Magic-byte PDF validation (blocker, finding 1).** Adds
+     `_is_real_pdf(blob)` in `steps/step_1_intake.py` — bytes must start
+     with `%PDF-` to be accepted. Wired in at every download site:
+       * `_process_self_attachments` Pass 2 — a new `invalid_pdfs` list
+         catches `.pdf`-named imposters (PNG/JPEG/HTML/Word bytes) and
+         flags the email via `run.review()` instead of letting an EMPTY
+         classification route the bytes as the subject.
+       * `_process_pdf_text_fallback` Pass 1 — same `invalid_pdfs` list
+         gates `can_route_all` alongside `download_failures`; the
+         all-or-nothing detail string surfaces the invalid filenames.
+       * `_process_prior_attachments` — appends the invalid name to
+         `download_failures` with an `(invalid PDF bytes)` suffix so the
+         existing conversation-link flag path triggers.
+     Scanner-made image-only PDFs still pass (the PDF wrapper carries the
+     header regardless of what's inside).
+
+  B. **PDF-text-first, filename as fallback (risk, finding 3).** Per user
+     direction, the evidence priority in `_classify_pdf_against_subject`
+     and the `_process_pdf_text_fallback` per-PDF loop is swapped: PDF
+     body text is the primary signal, filename is consulted only when
+     text doesn't yield a confident match. This catches the case where a
+     vendor renames a BCS 3396 invoice to "EPS 6008 invoice.pdf" to
+     match the wrong subject — pre-0.11.3 it would have AGREE'd via
+     filename and routed to EPS 6008; post-0.11.3 the PDF text wins,
+     outcome is CLASH, email flags for review. Existing 0.11.2 tests
+     still pass (the filename fallback fires on empty/ambiguous text).
+     New test `test_pdf_text_wins_over_conflicting_filename` covers the
+     Codex repro directly.
+
+  C. **`daily_summary.csv` migration concurrency + Excel-lock safety
+     (risk, finding 4).** `tools/_lib/log.py`:
+       * `summary.exists()` now checked INSIDE the portalocker lock so
+         two concurrent first-time runs on a fresh log dir can't both
+         write a header.
+       * `_migrate_summary_if_legacy` returns `bool` and wraps both the
+         read and the `tmp.replace()` in try/except OSError. If
+         migration fails (Excel has the file open), the function
+         returns False, the caller logs a WARNING and skips the append
+         rather than corrupting the file by appending a 7-column row
+         to a still-6-column file.
+       * `_append_summary_row` itself is wrapped in try/except OSError
+         so a CSV write failure logs a WARNING and returns rather than
+         crashing the step from its `finally` block.
+     The temp file (`.csv.migrating`) is cleaned up on replace failure.
+
+  D. **Partial-commit Outlook flag guard in the PDF-text fallback path
+     (risk, finding 5).** `_process_pdf_text_fallback` now mirrors the
+     guard already present in `_process_self_attachments`: when any
+     attachment in an email fails after others succeeded, the email is
+     flagged with the Outlook to-do marker before being left in the
+     Inbox. Without this, the email looked indistinguishable from
+     un-processed mail despite having committed PDFs downstream.
+     Triggers when, e.g., the PDF routes successfully but a sibling ZIP
+     download or write fails.
+
+Tests:
+
+  `tests/test_step1_filename_first.py` grew from 5 to 7 scenarios:
+    + `test_pdf_text_wins_over_conflicting_filename` (finding 3 repro)
+    + `test_is_real_pdf_magic_byte_check` (finding 1 helper)
+  Existing 5 tests updated for the new order (their outcomes were
+  identical pre- and post-swap because empty/ambiguous text falls back
+  to filename either way).
+
+Out of scope (accepted as-is):
+
+  - Finding 2 — a real PDF with weak Graph metadata (name="12345",
+    contentType="application/octet-stream", no invoice hint) is
+    discarded at categorisation. Niche enough to defer.
+  - Finding 6 — `_process_prior_attachments` still uses metadata-only
+    filtering for "is this a PDF?". The 0.11.3 magic-byte check applies
+    inside this function for bytes that ARE downloaded, but the
+    pre-download filter retains its existing semantics.
+
+
+---------------------------------------------------------------------------
+0.11.2  —  2026-05-12  —  Step 1 intake: TELUS ZIP fix, filename-first matching,
+                          PDF+ZIP-only filter, need_review reporting
+---------------------------------------------------------------------------
+First end-to-end run of Step 1 against the live Inbox (2026-05-12 diagnostic
+bundles) surfaced four bugs / reporting gaps plus one documentation issue.
+All five are addressed here. The strict-first ambiguous-PDF rule at
+`_decide_email_action` is INTENTIONALLY unchanged — it remains an open
+client risk-tolerance conversation.
+
+Fixes:
+
+  A. **TELUS ZIP attachments no longer fall through to "non-PDF/ZIP".**
+     `steps/step_1_intake.py` Pass 1 categorisation gated on `ext == ".pdf"`
+     before the `_looks_like_pdf_or_zip()` check, so ZIPs were sorted into
+     the non-PDF bucket and either triggered the all-or-nothing hold
+     (`_process_pdf_text_fallback`) or were saved as plain files instead
+     of being staged for Step 2 to unpack (`_process_self_attachments`).
+
+     Both functions now keep a dedicated `zip_atts` bucket. On the happy
+     path, ZIPs are downloaded and saved to `_Unmatched/Invoices/` (where
+     Step 2 picks them up). In `_process_pdf_text_fallback`, ZIPs no longer
+     gate the all-or-nothing decision — only unmatched PDFs and download
+     failures do.
+
+  B. **Signature images and one-off office files are discarded at intake.**
+     Outlook signature decorations (`image001.png`, `Outlook-*.png`,
+     `ServiceBox-Navy.png`, `~WRD*.jpg`) and `.docx` / `.xlsx` attachments
+     are now logged at INFO and dropped — not downloaded, not written to
+     `_Unmatched/`. This unsticks the ~9 emails per run that previously
+     hit all-or-nothing solely because of a sibling decoration image.
+
+     Per client direction, `.docx` / `.xlsx` invoices are accepted as part
+     of this trade-off (vendors are being asked to send PDFs going forward).
+
+  C. **Filename-first plan matching in Step 1.**
+     `_classify_pdf_against_subject` and the per-PDF loop in
+     `_process_pdf_text_fallback` now try
+     `plan_match.match_from_filename_with_base_fallback()` BEFORE
+     `extract_full_text()` + `match_from_pdf_text()`. Vendor-authored
+     filenames (e.g. `EPS 6008 - April 2026 Invoice #17942.pdf`,
+     `Kimberly Court LMS 1624 - April 2026 Invoice #17852.pdf`) are
+     treated as authoritative when they yield an active-plan match —
+     same helper Step 3 already uses, so the two stages agree.
+
+     Expected effect on the 17 strict-flagged emails: the multi-month
+     "consensus AMBIGUOUS" cases (EPS 6008, Kimberly Court LMS 1624,
+     LMS 3011 Aspen Gabels) become all-AGREE and route. The "boilerplate
+     sibling" cases (FSC_Fuel_Surcharge_, Options for Paying Your Invoice
+     NEW, FVFP - Customer Payment Options) still flag — those filenames
+     have no plan ID and the strict-first rule is unchanged.
+
+  D. **`need_review` counter replaces the misleading `errors=17` headline.**
+     `tools/_lib/log.py` `_Run` now carries a `need_review` list alongside
+     `processed` and `errors`. New `run.review(msg)` method appends and
+     logs at WARNING with a `NEED_REVIEW:` prefix. The three "left in
+     Inbox for human review" code paths in Step 1 now call `run.review()`
+     instead of `run.error()` / `run.info()`:
+       1. `FLAG_AND_HOLD` (strict-first ambiguous / clash) — was `run.error`.
+       2. `all-or-nothing` (PDF-text fallback can't route everything) — was `run.info`.
+       3. Subject-matched-but-no-eligible-prior-conversation — was `run.info`.
+
+     The `skip` paths (no plan + no attachments) stay on `run.info()` —
+     not counted under need_review per client direction. True exceptions
+     (download failures, Graph API failures, ledger errors) stay on
+     `run.error()`.
+
+     Run summary line changed from:
+       `processed=N errors=M duration=Xs status=...`
+     to:
+       `processed=N need_review=R errors=M duration=Xs status=...`
+     `daily_summary.csv` gains a `need_review` column between `processed`
+     and `errors`. A one-shot migration in `_append_summary_row` pads
+     pre-0.11.2 rows with `0` so historical data is preserved.
+
+  E. **Step 2 / Step 3 wording in the client training brief.**
+     `docs/client_training_brief.md` previously said Step 2 "Unpacks any
+     ZIP attachments" without specifying *where* it reads from. Operators
+     reasonably read that as "ZIPs in the Outlook Inbox" — actual code
+     reads `_Unmatched/Invoices/` only. Rewritten to explicitly call out
+     the folder, note that Step 2 does NOT touch Outlook, and clarify
+     that Step 3 sorts ANY PDF in `_Unmatched/Invoices/` (not just
+     zip-extracted ones).
+
+Tests:
+
+  `tests/test_step1_filename_first.py` (new) — five scenarios:
+    1. filename match returns AGREE without invoking text extraction
+    2. filename plan != subject -> CLASH
+    3. filename plan with no manager -> falls back to PDF text
+    4. boilerplate filename (no plan ID) -> falls back to PDF text
+    5. `run.review()` separation from `run.error()`
+
+Out of scope (deferred):
+
+  - The strict-first AMBIGUOUS rule in `_decide_email_action` is unchanged.
+    Boilerplate sibling PDFs continue to flag the whole email. Client risk-
+    tolerance conversation TBD.
+
+
+---------------------------------------------------------------------------
+0.11.1  —  2026-05-12  —  Codex review fixes for the 0.11.0 consolidation
+---------------------------------------------------------------------------
+Adversarial review by Codex on the 0.11.0 work surfaced one blocker and
+three risks. All four are addressed here. Full review filed at
+`codex-router-out/2026-05-12-step8-consolidation-review/codex-review.md`.
+
+Fixes:
+
+  A. **Filesystem scans no longer kill the morning email contract.**
+     The 0.11.0 release wrapped the Inbox query in try/except but the
+     two new pipeline-residue scans (`_scan_unmatched_intake`,
+     `_scan_manager_stuck`) could still raise on a permission error and
+     take down the whole `main()`, producing no email at all.
+
+     Each scan now returns a new `_ScanResult` dataclass (`rows` +
+     `errors`). Errors are collected per-folder (so one bad manager
+     doesn't hide the rest of the managers), passed through to the
+     email builder, and surfaced in a new Action Required sub-section
+     `-- Pipeline scan errors (investigate folder permissions) --`.
+     `main()` also wraps each scan call in a belt-and-braces try/except
+     so a future non-defensive code path still produces an email.
+
+     The "always-sent" contract Krisztian explicitly approved in 0.11.0
+     is now load-bearing again.
+
+  B. **Inbox-query failure now correctly counts in the subject.**
+     Before: `Subject: ... 0 action required, ...` even when the body
+     said "Inbox query failed — open Outlook directly." An operator
+     scanning subjects could miss the degraded Inbox status.
+
+     After: `inbox_error` adds +1 to `action_count`, so the subject
+     reflects exactly one item needing investigation. Same fix applies
+     to each entry in `scan_errors`.
+
+  C. **Manager-stuck scan is now glob-based (XLS-drift-safe).**
+     Before: `_scan_manager_stuck(rows)` iterated
+     `unique_managers(rows)` from the Strataplan snapshot. If the
+     snapshot was empty/malformed or all rows inactive (rare but real
+     during XLS edits), the scan returned `[]` even when manager
+     `Approved/` folders had stuck PDFs.
+
+     After: `_scan_manager_stuck()` (no args) globs
+     `<root>/Users/*/Invoices/Approved/*.pdf` directly. Manager name
+     comes from the directory segment; the scan is independent of the
+     XLS state. AP-only `Users/<X>/Paid_Invoices/` entries are
+     silently skipped (no `Invoices/Approved/` subdir).
+
+     The `unique_managers` import was dropped from
+     `steps/step_6_paid_archive.py` since this was its only caller.
+
+  D. **Test coverage for the scan helpers and degraded paths.**
+     Codex pointed out that the 0.11.0 test suite would have passed
+     even with the BLOCKER above present. Added:
+
+       - `tests/test_step6_scans.py` (new, 13 cases, 38 assertions):
+         covers missing folder, empty folder, mixed contents, unicode
+         filenames, iterdir/glob error trapping (per-folder isolation),
+         AP-only Users entries ignored, and the disk-only-no-XLS-row
+         case that proves the glob-based fix from (C).
+       - `tests/test_step6_summary_email.py` (3 new cases, 16 new
+         assertions): `inbox_error` counts as 1 in the subject;
+         scan_errors render their own sub-section AND count; clean day
+         renders exactly one `None today.` under Action Required.
+
+     The 0.11.0 test asserting `0 action required` when `inbox_error`
+     is set was locking in the bug — updated to the correct
+     `1 action required` after the (B) fix.
+
+Files:
+  - Modified: `steps/step_6_paid_archive.py` (new `_ScanResult` dataclass,
+    rewritten scan helpers, updated `main()` and
+    `_build_combined_summary_email`).
+  - Modified: `tests/test_step6_summary_email.py` (new signature,
+    corrected inbox_error subject, 3 new cases).
+  - Added: `tests/test_step6_scans.py`.
+  - Modified: `workflows/step_6_paid_archive.md`
+    (Outputs section documents the new Pipeline scan errors sub-section).
+  - Modified: `VERSION` → 0.11.1, `HANDOFF.md` (version line).
+  - Modified: `ReleaseNotes.txt` (this entry).
+
+No new `.env` keys. No operator-visible behavior change in normal (clean)
+operation. Degraded modes (Graph failure, folder permission error) now
+produce a more accurate subject line and a dedicated body sub-section.
+
+---------------------------------------------------------------------------
+0.11.0  —  2026-05-12  —  Consolidate Step 8 into Step 6's morning report
+---------------------------------------------------------------------------
+Operator now receives ONE automation email per weekday, not two. Step 6 at
+07:00 is the single morning surface for everything that needs attention.
+Step 8 (`step_8_inbox_sweep.py`, 18:00 Mon–Fri) is removed entirely.
+
+Background. The 18:00 Step 8 was queued to be read the NEXT morning, but
+Outlook groups it in the "Yesterday" block — Krisztian flagged that the
+operator's first morning check happens on the "Today" block, so a
+yesterday-grouped email was easy to deprioritise. With everything in Step
+6's 07:00 email, the consolidated report is the first piece of automation
+output of the day.
+
+Operator-visible changes:
+
+  A. Step 6's email gains an `== Action Required ==` section that
+     replaces and expands the old `== Unmatched ==`. Four sub-sections,
+     each suppressed when empty:
+
+       -- Paid invoices stuck (Step 6 couldn't archive) (N) --
+          Same content as the old Unmatched: AP Paid_Invoices/ files
+          where check number / date couldn't be read, plan missing from
+          XLS, etc.
+
+       -- Manager approvals stuck (Step 5 didn't pick up) (N) --
+          NEW. Scans every manager's Approved/ folder. Anything there
+          at 07:00 means Step 5 failed at 06:40 (file locked, write
+          error, or the file arrived after Step 5 ran).
+
+       -- Unmatched intake files (Steps 1/2/3 couldn't route) (N) --
+          NEW. Scans _Unmatched/Invoices/ (skipping Processed- markers).
+          Anything there means the automation can't sort the file on
+          its own — operator must rename + relocate manually.
+
+       -- Inbox emails (unhandled) (N) --
+          NEW (was Step 8). Live Graph query of the Inbox root at the
+          end of Step 6's run, reuses Step 8's per-message rendering
+          via the extracted `tools/_lib/inbox_report.py`.
+
+  B. Subject line shape changes from `... unmatched, ... duplicate ...`
+     to `... action required, ... duplicate ...`. Count is the sum of
+     all four sub-sections.
+
+  C. The `Duplicates` section now always renders (with `None today.` on
+     zero-duplicate days), matching how `Processed` and Action Required
+     already behaved. The README's old "silent good news" wording for
+     duplicates was already untrue in the code; this entry corrects it
+     in docs.
+
+  D. Inbox query failures degrade gracefully. If Graph is unreachable
+     at 07:00, the Action Required section renders a "query failed"
+     notice for the Inbox sub-section AND the rest of the email still
+     sends. The morning report is no longer lost to one transient
+     Graph error.
+
+Removed:
+  - `steps/step_8_inbox_sweep.py`
+  - `workflows/step_8_inbox_sweep.md`
+  - `tests/test_step8_inbox_sweep.py` (assertions ported to
+    `tests/test_inbox_report.py` against the extracted helper)
+
+Added:
+  - `tools/_lib/inbox_report.py` — `sender_display()` and
+    `render_messages(messages, start_number=1)` extracted from Step 8
+    so Step 6 can reuse the per-message formatting.
+  - `tests/test_inbox_report.py` (24 assertions across 7 cases).
+  - `tests/test_step6_summary_email.py` — REWRITTEN. 49 assertions
+    across 9 cases covering the new Action Required section, the
+    inbox-error degraded mode, and the legacy Processed / Duplicates
+    rendering.
+
+Changed:
+  - `steps/step_6_paid_archive.py`:
+      `_Outcomes` gains `manager_stuck` and `unmatched_intake` lists
+        (the existing `unmatched` field is kept and now exclusively
+        represents AP Paid_Invoices archive failures).
+      `_scan_unmatched_intake()` (new) — lists files in
+        _Unmatched/Invoices/ that aren't Processed- markers.
+      `_scan_manager_stuck(rows)` (new) — lists PDFs in each unique
+        manager's Approved/ folder.
+      `_build_combined_summary_email(...)` — new signature taking the
+        four Action Required sources plus optional `inbox_error`.
+      `main()` — runs the two new scans, queries the Inbox with
+        try/except, and passes everything to the new builder.
+  - `README.md` — schedule table loses the 18:00 row, "Seven daily ...
+    and an eighth" prose becomes "Six daily ... and a seventh", manual
+    run list drops Step 8, scheduling instructions say "six daily
+    tasks", new paragraph documents the consolidated morning email.
+  - `workflows/step_6_paid_archive.md` — Outputs section rewritten to
+    describe the Processed / Action Required / Duplicates layout.
+
+Operator action at deploy time:
+  1. Disable / delete the existing Task Scheduler entry that runs
+     `python steps\step_8_inbox_sweep.py` at 18:00 Mon–Fri.
+  2. Optionally shift the morning pipeline earlier (e.g. 05:00 → 06:00)
+     so the 07:00 report covers more of the morning's arrivals. No
+     code change required for that shift.
+
+Files:
+  - Modified: `steps/step_6_paid_archive.py`,
+    `workflows/step_6_paid_archive.md`, `README.md`, `VERSION`.
+  - Added: `tools/_lib/inbox_report.py`, `tests/test_inbox_report.py`.
+  - Rewritten: `tests/test_step6_summary_email.py`.
+  - Deleted: `steps/step_8_inbox_sweep.py`,
+    `workflows/step_8_inbox_sweep.md`,
+    `tests/test_step8_inbox_sweep.py`.
+
+No new `.env` keys.
+
+--------------------------------------------------------------------------
+0.10.1  —  2026-05-12  —  Step 1 commit-path hardening (Codex review fixes)
+--------------------------------------------------------------------------
+Codex reviewed 0.10.0 and found seven issues, all on the **commit path**
+(what happens to message state after `_decide_email_action` returns).
+The decision matrix itself was correct; the bugs were that the matrix's
+verdict didn't always translate to operator-visible state. Each fix
+preserves strict-first: when something goes sideways, flag the email
+loudly rather than let it look like ordinary mail.
+
+Fixes:
+
+  A. **Self-attachment partial-batch failure now flags.**
+     `_process_self_attachments` — if any attachment in the batch
+     returned `FAILED` after others routed, the email now gets the
+     Outlook to-do flag with a `partial commit on '<subject>': N of M
+     attachments committed before F failure(s)` error log. Committed
+     files are already on disk + in the duplicate ledger (no rollback)
+     — the flag + log are the operator's reconciliation signal.
+     Previously: email sat in the Inbox unflagged, indistinguishable
+     from ordinary mail; next runs duplicate-skipped the success and
+     re-failed the failure forever.
+
+  B. **Conversation-link partial commit no longer moves the source.**
+     The outer-loop `consumed_prior_ids.add(prior_id)` only fires when
+     a prior's outcomes are *all clean* (ROUTED / DUPLICATE_SKIPPED).
+     A `[ROUTED, FAILED]` prior is now treated like a clash: flag the
+     reply, leave both messages in the Inbox, do NOT add to
+     `consumed_prior_ids`. Previously: the partial-commit prior got
+     added to `consumed_prior_ids`, so when the outer loop later
+     reached the prior message itself, it moved it to `processed_emails`
+     and hid the failure.
+
+  C. **Flagged-conversation-link priors are now quarantined across the
+     outer loop.** Added `flagged_prior_ids: set[str]` alongside
+     `consumed_prior_ids`. When `_process_prior_attachments` returns
+     `flagged=True` (or the new partial-commit branch fires), the
+     prior's id goes into this set. The outer-loop skip check now
+     handles both: `consumed_prior_ids` -> skip+move; `flagged_prior_ids`
+     -> skip+DON'T move. Previously: a flagged prior could later be
+     picked up in the outer loop and re-processed via Branch A / C if
+     its own subject or PDF text matched a plan, potentially routing
+     its PDFs under a different plan than the reply pointed at.
+
+  D. **`_flag_message_safely` returns bool and logs `FLAG_SET_FAILED:`.**
+     The Outlook to-do flag is the operator-facing signal for this
+     release; a silent Graph failure (permissions, rate-limit, schema)
+     would degrade a dangerous clash into ordinary backlog. The wrapper
+     now returns True/False and logs at error level with a grep-able
+     prefix when the PATCH fails. Callers don't act on the return yet
+     (the email-in-Inbox state is already correct from each branch's
+     normal logic); the loud log is the escalation surface.
+
+  E + F. **Workflow doc Edge-cases section updated** to match v0.10.0
+     behaviour. Three drifted bullets fixed (multi-PDF emails, scanned
+     PDFs, prior multi-PDF) plus new bullets for partial-commit and
+     `FLAG_SET_FAILED:` semantics.
+
+  G. **`plan_base` is robust to leading/trailing whitespace.** Now
+     does `str(plan_norm).strip().upper()` before the regex. Current
+     callers all pass already-normalised `PlanRow.plan_norm` so no
+     production behaviour change, but the helper is public-shaped and
+     was bait for a future caller. Added test cases for whitespace,
+     digits-only, and prefix-only inputs.
+
+  H. **Release notes (0.10.0) softened.** Replaced the overclaiming
+     'previously routed correctly continue to route correctly' line
+     with the actual trade: stricter matching can flag previously-
+     routing edge cases, plus an explicit list of operator-visible
+     scenarios (partial commits, flag-set failures).
+
+  I. **Test-input cleanup in `test_step1_decision.py`.** The
+     suffix-variant test for `BCS2707A + BCS2707B` used a logically
+     impossible classification (CLASH with the same plan as the
+     subject). Replaced with AGREE+CLASH, then added a second case
+     for subject-vs-PDF suffix collision where no PDF AGREEs.
+
+Tests: every existing test still passes. New whitespace cases added to
+`test_plan_match.py::test_plan_base`. Improved suffix-variant cases in
+`test_step1_decision.py::test_suffix_variants_flag`.
+
+Files touched:
+  - `tools/_lib/plan_match.py` (plan_base normalization)
+  - `steps/step_1_intake.py` (Fixes A–D + new flagged_prior_ids set)
+  - `workflows/step_1_intake.md` (Edge cases section)
+  - `tests/test_plan_match.py`, `tests/test_step1_decision.py`
+  - `ReleaseNotes.txt` (this entry + 0.10.0 wording softened)
+
+Verification of the partial-commit and flagged-prior paths is by
+inspection of the new flag/log calls plus the existing decision-matrix
+unit tests. A future PR could add an integration test that mocks
+`_route_pdf` + Graph helpers to exercise partial-commit flagging end-to-end.
+
+
+--------------------------------------------------------------------------
+0.10.0  —  2026-05-12  —  PDF cross-validation + Outlook to-do flag in Step 1
+--------------------------------------------------------------------------
+Step 1 now treats every PDF as a second opinion on the subject's plan
+match instead of trusting the subject blindly. Two real problems get
+fixed: vendors who type the wrong plan in the subject while the PDF
+has the correct one, and multi-PDF emails where each invoice belongs
+to a different strata.
+
+What's new:
+
+  1. PDF text is scanned on every email where the subject (or body)
+     matched a plan — not just on the no-match fallback. The scan
+     reuses the in-memory bytes already downloaded for routing; no
+     extra Graph calls.
+
+  2. Each PDF is classified AGREE / EMPTY / AMBIGUOUS / CLASH against
+     the subject's plan. `steps/step_1_intake.py::_decide_email_action`
+     combines per-PDF classifications into one of:
+       - ROUTE_AS_SUBJECT — every PDF agrees with the subject (or is
+         a scanned image with no text). Current behaviour.
+       - AUTO_SPLIT — multi-PDF email where every PDF identifies its
+         own DISTINCT plan base (e.g. BCS 2707 + BCS 2800). Each PDF
+         routes to its own manager; subject is ignored.
+       - FLAG_AND_HOLD — strict-first default for everything else
+         (single-PDF clash, consensus clash, suffix-variant clash,
+         ambiguous text, empty-mixed-with-clash). Sets the Outlook
+         "Flag as to-do" on the message (red flag in Outlook -> green
+         checkmark when the operator marks complete), leaves the
+         email in the Inbox, writes nothing to disk.
+
+  3. Suffix-variant failsafe via `tools/_lib/plan_match.py::plan_base`:
+     LMS4193C / LMS4193T / LMS4193S share base LMS4193, so a multi-PDF
+     email split across these gets flagged for review (vendors confuse
+     these easily). Same convention as `xls.base_plan_index`.
+
+  4. Conversation-link recovery (reply-to-self) also classifies each
+     prior PDF. The pre-0.10.0 limitation ("ALL PDFs in the prior get
+     routed using the reply's plan, with only a count>1 warning") is
+     gone. On clash/ambiguity, the reply is flagged and the prior-walk
+     stops.
+
+  5. `tools/_lib/graph.py::flag_message` — new helper. PATCH the
+     message's `flag` property to `{flagStatus: flagged}`. The
+     operator clears it in Outlook (which sets `flagStatus =
+     complete`) when handled.
+
+What's the same:
+
+  - All-or-nothing rule for unmatched emails (subject + body + PDF
+    all miss): unchanged.
+  - Receive-stamping, duplicate ledger, conversation-link walk
+    direction (newest-first): unchanged.
+  - Non-PDF attachments still park in `_Unmatched/Invoices/` on route
+    paths; on FLAG_AND_HOLD they stay in the email (strict-first).
+  - No new env vars, no new step files, no folder layout changes.
+
+Backwards-compatibility: file paths, env vars, step contracts
+unchanged. The matching path is **stricter, not stricter-and-different**:
+most emails that previously routed correctly still route correctly.
+Emails that previously routed but had ambiguous PDF text, suffix-variant
+attachments, or marginal cross-checks may now flag for review instead —
+that's the intended trade. Admins deploying this version should expect
+a small bump in flagged-email volume during the first weeks while the
+strata managers' labelling stabilises.
+
+Known operator-visible scenarios (see also 0.10.1 fixes below):
+  - Batch partial commits (PDF #1 routed, PDF #2 fails) leave the email
+    in the Inbox with the red flag set (since 0.10.1) and a
+    `partial commit on '<subject>'` error log line.
+  - Graph flag-set failures (rare; permissions / rate-limit / schema)
+    log `FLAG_SET_FAILED:` at error level and leave the email in the
+    Inbox WITHOUT a red flag. Admins should grep for this prefix in
+    the daily log if the flagged-email queue feels under-populated.
+
+Strict-first stance: flag now, relax later if strata managers prove
+their labelling is reliable. Specific paths for relaxation are noted
+in `To-Speak-About.txt`'s 2026-05-12 top entry.
+
+Tests:
+  - `tests/test_plan_match.py::test_plan_base` — suffix extraction.
+  - `tests/test_graph.py::test_flag_message_url_and_body` — PATCH URL
+    + body shape.
+  - `tests/test_step1_decision.py` (new) — full coverage of the
+    nine matrix cases including the user's motivating examples
+    (BCS 2707 vs BCS 2800 auto-split, LMS4193C vs LMS4193T flag,
+    EPS4280 vs EPS4280A flag, consensus clash, empty-mixed-with-
+    clash).
+
+Docs updated:
+  - `workflows/step_1_intake.md` — new "PDF cross-validation"
+    section, decision-matrix table, and "Operator workflow for
+    flagged emails" section.
+  - `To-Speak-About.txt` — new top entry summarising the decided
+    policy; the 2026-05-11 multi-PDF entry's Question 1 marked
+    resolved with a back-reference.
+  - `docs/client_training_brief.md` — operator section explaining
+    what the red flag means and how to clear it.
+
+
+--------------------------------------------------------------------------
+2026-05-12  —  (doc-only)  To-Speak-About.txt: multi-PDF Q2 decided
+--------------------------------------------------------------------------
+Documentation-only change. One update to the multi-PDF emails section
+of `To-Speak-About.txt`. No code touched, no version bump.
+
+Q2 decided — "ZIP attachments from unidentified emails: auto-save, or
+wait for the operator?" Decision: Option A kept. ZIPs in emails
+without a clear plan match continue to stay in the Inbox for the
+operator to handle manually. The all-or-nothing gate in
+`steps/step_1_intake.py::_process_pdf_text_fallback` already enforces
+this — the decision endorses, doesn't change, the status quo.
+Option C (msg_id ledger to auto-save without the daily duplicate
+pile-up) noted as the future automation path if manual handling
+proves burdensome. No code change needed.
+
+
+--------------------------------------------------------------------------
+0.9.3  —  2026-05-12  —  Enriched unmatched reporting + new Step 8
+--------------------------------------------------------------------------
+The morning Invoices summary's Unmatched section used to show only
+filename / reason / planKey — enough to know something was stuck but
+not enough to investigate. And separately, Step 1's "stuck in Inbox"
+emails (unidentified subjects / body / PDF text) had no daily report
+at all — operators had to remember to look.
+
+Two changes:
+
+A. Step 6 Unmatched section enriched with file-side context.
+   Each row now also carries:
+     - AP name (which AP's Paid_Invoices folder the PDF was in)
+     - Local filesystem path (so the supervisor can paste-and-open)
+     - File mtime as "YYYY-MM-DD HH:MM" PT — tells them how long
+       it's been stuck
+
+   The 6 unmatched-append sites in `_archive_one` and the reconcile
+   path in `main()` were updated uniformly. `_archive_one` gained an
+   `ap_name: str` parameter threaded from the outer AP loop. A small
+   `_format_mtime(Path) -> str` helper handles the timezone formatting
+   and tolerates stat failures (returns "" rather than raising).
+
+   Email rendering is conditional: the AP / Path / Stuck since lines
+   only appear when the row carries those fields, so legacy or
+   degraded rows still render cleanly.
+
+   Sender-side context (sender_domain) was NOT added to the Step 6
+   unmatched rows even though the ledger now carries it (0.9.2). By
+   Step 6 the original email is long gone and the investigator needs
+   the file on disk, not the email — different failure mode.
+
+B. New Step 8 — end-of-day Inbox sweep at 18:00 Mon–Fri.
+   Queries the Outlook Inbox root via Graph and emails a "stuck
+   emails" report listing whatever the secretary didn't clear during
+   her workday. Each row: sender display, sender domain, subject,
+   received-datetime, has-attachments flag, and Graph msg id (paste
+   into Outlook search to jump straight to it).
+
+   Always sent — empty days send "Inbox clear — nothing stuck." so
+   silence is a real "cron didn't fire" signal, same pattern as the
+   0.9.1 morning summary.
+
+   Recipient is `config.notify_email()` — same resolution chain as
+   Step 6 (override during shadow, default after cutover). No new
+   env var. Read-only — Step 8 never moves, deletes, or marks
+   anything in Outlook.
+
+   Settles To-Speak-About.txt Question 1 of the dup-detection block
+   ("who gets the duplicate-summary email") and the broader question
+   of "how does the AP supervisor know what's still sitting in the
+   secretary's inbox at end-of-day." Single recipient, two reports:
+   the 07:00 Invoices summary covers the previous night's processed
+   work, the 18:00 Inbox sweep covers what's still pending.
+
+Code:
+  - `steps/step_6_paid_archive.py::_archive_one` — `ap_name` param.
+    `_format_mtime` helper. Six unmatched dicts enriched with
+    apName / localPath / mtimeIso.
+  - `steps/step_6_paid_archive.py::_build_combined_summary_email` —
+    Unmatched rendering extended (conditional lines for the three
+    new fields).
+  - `steps/step_8_inbox_sweep.py` (new) — `_sender_display`,
+    `_build_inbox_stuck_email` (pure builder for testability), and
+    `main()`.
+  - `tools/_lib/dup_fingerprint.py::extract_domain` — reused as-is
+    for Step 8's sender-domain extraction. No changes.
+
+Tests:
+  - `tests/test_step6_summary_email.py` — extended `_unmatched_row()`
+    helper, new assertions for AP / Path / Stuck since lines, and a
+    `test_unmatched_minimal_fields` case covering legacy rows.
+  - `tests/test_step8_inbox_sweep.py` (new) — 25 assertions across
+    empty / single / multiple / malformed-from / display-fallback
+    cases. Standalone (no pytest).
+
+Operator setup (one-time, when ready to enable):
+  Add a new Windows Task Scheduler entry — Daily Mon–Fri at 18:00,
+  Action: `python steps\step_8_inbox_sweep.py`, Start in: project
+  root. README.md schedule table updated.
+
+
+--------------------------------------------------------------------------
+0.9.2  —  2026-05-12  —  sender_domain as 4th Layer B dedup factor
+--------------------------------------------------------------------------
+Settles `To-Speak-About.txt` duplicate-detection Q3 ("Should the
+duplicate-catcher also track vendor name?"). Adds the email sender's
+domain as a 4th deterministic factor to Layer B, closing the rare but
+real cross-vendor false-positive scenario without an LLM call or a
+hand-maintained vendor list.
+
+Before:
+  Layer B key = (plan_norm, invoice_number, amount_cents)
+  Two vendors who happened to share an invoice number for the same
+  property at the same amount (e.g. ABC Plumbing INV-1023 / $850 /
+  BCS 2707 vs XYZ Cleaning INV-1023 / $850 / BCS 2707) collided —
+  the second arrival silently flagged as a duplicate of the first.
+
+After:
+  Layer B key = (plan_norm, invoice_number, amount_cents, sender_domain)
+  `sender_domain` is the lowercased domain of the email's `From:`
+  address, already present in Graph metadata — Step 1 just stops
+  discarding it. ABC and XYZ carry distinct domains, so they live as
+  distinct Layer B rows. Free, deterministic, no PDF parsing, no
+  external API.
+
+Layer B now fires only when all four fields are non-blank. Non-email
+entry points (Steps 3/5/6: manual drops, retries) pass a blank
+sender_domain and rely on Layer A (file sha256) only. Acceptable
+trade-off — regeneration-with-different-bytes is overwhelmingly an
+email-vendor phenomenon, and the override path handles the rare miss.
+
+Backwards-compatible schema:
+  - New column `sender_domain` added to `_state/invoice_fingerprints.csv`
+    (now 11 columns). Existing CSVs written before this version parse
+    fine via the `.get(field, "")` pattern that aggregation_ledger
+    already uses — legacy rows deserialize with sender_domain="" and
+    keep Layer A coverage; they're deliberately excluded from Layer B
+    because their vendor is unknown.
+  - No data migration required. Open `_state/invoice_fingerprints.csv`
+    in Excel and the new column appears next to amount_cents.
+
+Conversation-link routing (Step 1 reply-to-self recovery): the
+fingerprint uses the PRIOR message's `From:` domain, not the reply's
+— the reply is the operator's own address and would collapse every
+reply-to-self into one fake "vendor."
+
+Code:
+  - `tools/_lib/dup_fingerprint.py::extract_domain` — new helper.
+    Accepts Graph's `{"emailAddress": {"address": ...}}` shape, bare
+    strings, or "Name <addr>". Tolerant of None / malformed input
+    (returns "").
+  - `tools/_lib/dup_ledger.py` — HEADER, FingerprintRow, make_row,
+    _parse_csv_rows, _build_indexes, find_by_semantic_key, and
+    find_overridden_by_semantic_key updated to the 4-tuple key.
+    Layer B requires all four fields non-blank.
+  - `steps/step_1_intake.py` — `sender_domain` extracted at the top
+    of the per-message loop via `dup_fingerprint.extract_domain(
+    msg.get("from"))`, threaded through `_route_pdf`, `_check_dup_status`,
+    `_process_self_attachments`, `_process_prior_attachments`, and
+    `_process_pdf_text_fallback`. The prior-attachments path extracts
+    the prior msg's domain separately.
+  - `steps/step_3_pdf_sort.py`, `step_5_to_ap.py`, `step_6_paid_archive.py`
+    — pass sender_domain="" (file-only entry points have no email).
+  - `tools/dup_override.py` and `tools/dup_reconcile.py` — no changes
+    needed; they key on sha256.
+
+Tests (all green via `python tests/test_dup_fingerprint.py` /
+`python tests/test_dup_ledger.py`):
+  - `extract_domain` — Graph dict shape, bare string, "Name <addr>",
+    case-folding, None / empty, malformed (no @ / no domain / no dot /
+    whitespace).
+  - Cross-vendor scenario: same plan + invoice number + amount,
+    different sender domains → NOT a duplicate (the Q3 fix).
+  - Blank sender_domain row excluded from Layer B (mirrors file-only
+    paths).
+  - Legacy CSV (pre-sender_domain HEADER) loads without error and
+    legacy rows get sender_domain="".
+
+Docs:
+  - `workflows/duplicate_detection.md` — schema, Layer B description,
+    and the "non-email entry points" rule updated.
+  - `To-Speak-About.txt` Q3 — settled and removed from the file; the
+    decision is recorded in these release notes.
+
+
+--------------------------------------------------------------------------
+2026-05-12  —  (doc-only)  To-Speak-About.txt: Q2 reframed, Q4 decided
+--------------------------------------------------------------------------
+Documentation-only change. Two updates to the duplicate-detection section
+of `To-Speak-About.txt`. No code touched, no version bump.
+
+Q2 reframed — "Should the override CLI keep requiring a typed reason?"
+The original question presumed operators would run `tools/dup_override.py`
+from a terminal. They won't — the people processing invoices live in
+Outlook and follow a minimal training brief, so a CLI gesture has zero
+chance of being used in practice. Question rewritten to ask: how should
+an operator mark a flagged duplicate as legitimate using only Outlook?
+Four options surfaced for the client conversation:
+  1. Reply to the daily duplicate-summary email ("Allow #2 — …")
+  2. Reply to the flagged duplicate email itself with OVERRIDE in subject
+  3. Drag email into a new `Inbox/duplicate_release` folder
+  4. Tiered: drag for routine, reply-with-reason for archived overrides
+Nested sub-question preserved: audit reason required / optional / skipped.
+`tools/dup_override.py` stays as a developer escape hatch — not removed.
+
+Q4 decided — "When a duplicate matches something very old, do you want
+to be told?" Decision: Option 1, silently skip stale matches, no separate
+stale section. Reasoning recorded inline in the file: with Layer A
+(sha256) plus Layer B (plan + invoice# + amount) in place, a stale match
+implies the vendor effectively re-sent the exact same invoice, which is
+exactly what duplicate detection is supposed to suppress. The Q2 override
+gesture (once chosen) is the safety net for the rare genuine stale-
+collision. No code change needed — current behaviour already matches
+the decision.
+
+
+--------------------------------------------------------------------------
+0.9.1  —  2026-05-12  —  Single daily "Invoices summary" email from Step 6
+--------------------------------------------------------------------------
+Step 6 used to send up to three separate end-of-run emails — processed,
+unmatched, and duplicates — each gated on its own section being non-empty.
+That meant a quiet morning could send zero, one, two, or three emails to
+the AP supervisor, and silence was ambiguous (cron didn't fire? or just
+nothing to report?).
+
+Rolled into one daily email instead:
+
+  Subject: "Invoices summary — N processed, M unmatched, K duplicate — <date>"
+  Body:    Three sections with explicit counts. Empty sections render
+           "None today." rather than being omitted, so a silent inbox
+           is now a real "cron didn't run" alarm.
+
+Recipient is unchanged — still `config.notify_email()` (resolves to
+`NOTIFY_OVERRIDE_EMAIL` during shadow, `NOTIFY_DEFAULT_EMAIL` post-cutover).
+
+Code:
+  - `steps/step_6_paid_archive.py::_build_combined_summary_email` replaces
+    the three private builders. Single `graph.send_mail` call replaces
+    the three try/except blocks.
+  - Per-row `run.error("unmatched: …")` log lines preserved verbatim.
+
+Tests:
+  - `tests/test_step6_summary_email.py` (new) — 27 assertions across
+    all-empty, all-populated, partial, and "no filesystem path leak"
+    cases. Standalone (no pytest), runs via
+    `python tests/test_step6_summary_email.py`.
+
+Settles `To-Speak-About.txt` 2026-05-11 duplicate-detection Question 1
+("who gets the duplicate-summary email") — by bundling, the question
+collapses into "who gets the Invoices summary", which is the AP
+supervisor by default.
+
+
+--------------------------------------------------------------------------
+0.9.0  —  2026-05-12  —  Duplicate invoice detection across the pipeline
+--------------------------------------------------------------------------
+Vendors sometimes send the same invoice 2-3 times in a week. The pipeline
+now catches that before it wastes manager or accountant attention. A
+persistent ledger at `_state/invoice_fingerprints.csv` records every
+unique invoice that flows through; same-day, next-day, and weeks-later
+duplicates are all detected.
+
+Two-layer fingerprint per PDF:
+  Layer A  SHA-256 of the PDF bytes. Catches verbatim resends ("Send"
+           pressed twice; accounting system auto-resent). Free,
+           deterministic, no false positives.
+  Layer B  (plan_norm, invoice_number, amount_cents) extracted from
+           the PDF text. Catches "vendor regenerated the same invoice
+           with different bytes". Invoice number is recognized via
+           labels like `Invoice #`, `Invoice No.`, `INV:`. Amount via
+           `Total Due` / `Amount Due` / `Balance Due` / `Grand Total`.
+
+Vendor name is NOT extracted (avoids per-invoice LLM cost; invoice
+numbers don't collide across vendors in practice).
+
+Hook points (where the check fires):
+  - Step 1 intake — inside `_route_pdf`. Primary catch (~95% of dups).
+  - Step 3 pdf_sort — after `read_bytes()`. Catches duplicates from ZIP
+    extraction or operator manual drops into `_Unmatched/`.
+  - Step 5 to_ap — after `read_bytes()` in `_transfer_phase`. Safety
+    net for PDFs the manager dragged straight into `Approved/`.
+  - Step 6 paid_archive — after archive write. Enriches the ledger
+    row with `archive_path` for the daily summary.
+
+Email routing (Step 1):
+  - All attachments duplicate => `Inbox/duplicate_emails`
+  - Mix of fresh routes + duplicates => `Inbox/processed_emails`
+  - All fresh routes => `Inbox/processed_emails` (unchanged)
+  - Any genuine failure => stay in Inbox (unchanged all-or-nothing)
+
+  Operator setup: create `Inbox/duplicate_emails` subfolder in OWA once,
+  same way `Inbox/processed_emails` was created.
+
+PDF routing on duplicate hit:
+  - Step 1: nothing written to disk. The email itself preserves the
+    bytes in `Inbox/duplicate_emails`; the original archived PDF is
+    referenced via `archive_path` in the ledger. Zero new local files.
+  - Step 3: source renamed `Processed-<ts>-DUPLICATE-<name>.pdf` so
+    Step 3's glob excludes it next run.
+  - Step 5: source renamed `Processed - DUPLICATE - <name>.pdf` in the
+    manager's `Approved/` folder.
+
+Daily duplicate-summary email:
+  Step 6 at 07:00 emits "Duplicate invoice detections: N — <date>" to
+  `notify_email()` when at least one fingerprint had its `dup_count`
+  incremented today. Zero-duplicate days produce no email. Each entry
+  lists plan, original archive path or current pipeline location,
+  extracted invoice number, amount, first-seen date, and total times
+  seen.
+
+Ledger:
+  Single CSV at `_state/invoice_fingerprints.csv`, one row per unique
+  fingerprint, forever retention. Upsert-in-place (not append-only) so
+  state transitions overwrite the row and only `dup_count` accumulates.
+
+  Schema (10 columns):
+    first_seen_date, sha256, plan_norm, invoice_number, amount_cents,
+    archive_path, current_stage, last_seen_date, dup_count, last_dup_date
+
+  Stages: intake, manager_queue, ap_queue, archived, quarantined,
+  overridden, superseded. `superseded` marks an overridden row whose
+  Layer B semantic key was matched by a regenerated PDF — the old sha
+  is retained as audit history and blocks future arrivals of those
+  exact bytes; the new sha gets a fresh row.
+
+  Sizing budget at 45-60 invoices/day:
+    Year 1:    ~2 MB  (15K rows)
+    Year 5:   ~11 MB  (75K rows)
+    Year 10:  ~22 MB  (150K rows)
+  Excel-friendly indefinitely. No archive rotation needed.
+
+  Audit trail (subject lines, message IDs, per-decision logs) stays in
+  the existing per-step daily logs. The fingerprint file is purely the
+  dedup key + pointer to the original.
+
+  Corrupted-ledger handling: `load()` raises ValueError on a malformed
+  row; the step halts the day. Silent-treat-as-empty would re-enter
+  every previously-archived invoice into the pipeline.
+
+Concurrency model — transactional read-modify-write:
+  Every mutator (`upsert`, `increment_dup_count`, `update_stage`,
+  `consume_override_and_insert`) is transactional. The lock spans the
+  full read-modify-write cycle, NOT just the final write:
+
+    1. Acquire portalocker.Lock
+    2. Re-read disk into a fresh in-memory snapshot
+    3. Apply the mutation to that fresh state
+    4. Write the whole CSV via safe_io.atomic_write_bytes
+    5. Release the lock
+    6. Commit the new state to the in-memory caches
+
+  In-memory state is committed ONLY after the lock is released and the
+  write succeeded. If the write raises, the in-memory caches stay at
+  the pre-mutation snapshot so the caller can retry with a coherent
+  view (no phantom rows). If two processes mutate the same ledger
+  (hand-run + cron overlap), the second transaction sees the first's
+  writes during its locked re-read — no lost-update race.
+
+  Reads (`find_by_hash`, `find_by_semantic_key`) consult the in-memory
+  cache and may be stale by up to one mutation cycle; the subsequent
+  mutation re-reads under the lock so a stale "not seen" doesn't cause
+  data loss in the ledger itself (see "Known limitation" below for the
+  narrow PDF-write race).
+
+  `find_by_semantic_key` excludes rows in `overridden` and `superseded`
+  stages so those rows don't block new arrivals via Layer B. The
+  explicit `find_overridden_by_*` helpers surface override rows for
+  the consumption path.
+
+`_route_pdf` signature change:
+  Returns `RouteOutcome` (`routed` / `duplicate_skipped` / `failed`)
+  instead of a bare bool. All three Step 1 callers
+  (`_process_self_attachments`, `_process_prior_attachments`,
+  `_process_pdf_text_fallback`) updated to branch on the enum. The
+  Pass 1 / Pass 2 architecture in `_process_pdf_text_fallback` extended:
+  Pass 1 records a non-mutating duplicate check per PDF; Pass 2's
+  `can_route_all` gate accepts "matched and duplicate" as auto-
+  handleable (the system knows what to do — skip it). Pass 2 commits
+  to ledger only when the email is fully auto-handleable, so a
+  short-circuited email does NOT pollute `dup_count`.
+
+Override consume semantics (one-shot):
+  An override is consumed differently depending on which layer hits:
+
+  Layer A (same bytes re-arrive):
+    `_check_dup_status` sees `current_stage=overridden` and treats it
+    as "route normally". The post-route `upsert` overwrites the
+    override row in place with `current_stage=manager_queue`. The
+    override is now spent; future arrivals of these exact bytes
+    block as normal duplicates.
+
+  Layer B (regenerated bytes, same semantic key):
+    `_check_dup_status` surfaces the override row separately via
+    `find_overridden_*`. After a successful route, the caller invokes
+    `ledger.consume_override_and_insert(old_sha, new_row)` which
+    atomically: (a) verifies the old row is still `overridden`,
+    (b) marks it `superseded`, (c) inserts the new sha row. The old
+    sha is retained as audit history; a future re-arrival of the OLD
+    bytes hits a `superseded` row and IS blocked as a duplicate.
+
+  Double-consume protection: `consume_override_and_insert` re-reads
+  the old row's stage inside the locked transaction. If it's no
+  longer `overridden` (already consumed by another process or call),
+  it raises ValueError. Callers catch this and fall back to a plain
+  `upsert` so a race between two regen-arrivals doesn't blow up.
+
+Operator CLIs (on-demand, not scheduled):
+  python tools/dup_override.py <sha256_prefix> --reason "..."
+    Marks a fingerprint as `overridden` so the next arrival routes
+    through normally (one-shot — consumed by the next pipeline pass).
+    Reason is required and logged to `logs/dup_override_<date>.log`.
+    Prefix must be hex-only and >= 12 characters (or a full 64-char
+    SHA) to avoid typo-induced wrong-row matches; validation runs
+    before ledger load so the error is clear even without env config.
+
+  python tools/dup_reconcile.py [--tsv out.tsv]
+    Walks every pipeline folder, hashes every PDF, cross-checks
+    against the ledger. Reports orphans (on disk, not in ledger),
+    stale archived rows (ledger -> missing file), multi-arrival
+    fingerprints (`dup_count > 0`), and orphan `.tmp.<pid>` files
+    left behind by interrupted atomic writes. Read-only; does NOT
+    mutate.
+
+Edge cases handled:
+  - Same-day double arrival in one Step 1 run (in-memory ledger reflects
+    the prior insert before the second lookup).
+  - Duplicate weeks after archival (summary email references the
+    archive path verbatim).
+  - Conversation-link "you already sent this" (reply + prior both
+    move to `duplicate_emails`).
+  - Manager manual drop into `Approved/` (Step 5 catches via safety
+    net; orphan rows are self-healing — new row inserted at ap_queue).
+  - OLD bytes re-arrive after Layer B override consume: blocked as
+    duplicate (superseded row remains active for Layer A matching).
+  - Two concurrent processes both consuming the same override: only
+    the first succeeds; the second falls back to plain upsert.
+  - Cross-process mutation race (hand-run + cron): transactional RMW
+    ensures no lost ledger updates.
+  - Ledger missing (first run): empty ledger, auto-created.
+  - Ledger corrupted: halt with clear error.
+  - Atomic-rewrite mid-write crash: previous good copy survives;
+    in-memory state untouched so caller can retry coherently.
+
+Known limitation:
+  Cross-process check-then-write TOCTOU. Steps consult the ledger
+  via in-memory lookups BEFORE writing a PDF to disk. The mutation
+  itself is transactional under the lock, but the preceding check
+  is not. In the narrow window between "Process A read the ledger
+  and concluded the fingerprint was new" and "Process A's upsert
+  acquired the lock", Process B can insert a row for the same
+  fingerprint. Both A and B then write their PDF to disk. Realistic
+  exposure under normal Task Scheduler timing (06:00 / 06:20 /
+  06:40 / 07:00) is essentially zero; the race requires a hand-run
+  overlapping a cron AND both runs picking up the same fingerprint.
+  Documented in `workflows/duplicate_detection.md` under "Known
+  limitation"; a complete fix would require restructuring the PDF
+  write path to reserve the ledger entry before writing.
+
+Files:
+  New code:
+    tools/_lib/dup_fingerprint.py        (Layer A + B extractors)
+    tools/_lib/dup_ledger.py             (transactional upsert-in-place
+                                          ledger, _transact() primitive,
+                                          consume_override_and_insert)
+    tools/dup_override.py                (operator CLI, hex-only prefix
+                                          validation, min 12 chars)
+    tools/dup_reconcile.py               (operator CLI, orphan-tmp
+                                          reporting added)
+    workflows/duplicate_detection.md     (SOP + known limitation)
+    tests/test_dup_fingerprint.py        (8 cases, all green)
+    tests/test_dup_ledger.py             (16 cases, all green: load /
+                                          upsert / find_by_hash / Layer B
+                                          semantic / increment_dup_count /
+                                          update_stage / corrupted row /
+                                          empty sha / atomic crash safety /
+                                          transactional RMW no-lost-update
+                                          across two Ledger instances /
+                                          overridden row excluded from
+                                          semantic index / consume override
+                                          Layer B regen / consume override
+                                          double-consume protection /
+                                          consume override missing-old-sha /
+                                          increment_dup_count missing-sha /
+                                          flush-failure rollback)
+  Touched:
+    tools/_lib/paths.py                  (`invoice_fingerprints_csv()`)
+    steps/step_1_intake.py               (RouteOutcome enum,
+                                          duplicate_emails folder lookup,
+                                          ledger load,
+                                          Pass 1/Pass 2 update,
+                                          _email_destination helper,
+                                          _check_dup_status returns
+                                          (sha, inv, amount, duplicate,
+                                          overridden), consume-override
+                                          path with ValueError fallback)
+    steps/step_3_pdf_sort.py             (hash check + Layer B + override
+                                          consume before stamp)
+    steps/step_5_to_ap.py                (safety-net hash check + Layer B
+                                          + override consume; prior_same_sha
+                                          excludes overridden/superseded)
+    steps/step_6_paid_archive.py         (ledger archive update +
+                                          daily duplicate summary email)
+    README.md                            (duplicate-detection section,
+                                          new troubleshooting entries,
+                                          duplicate_emails folder marked
+                                          required in setup)
+    VERSION                              (0.9.0)
+    To-Speak-About.txt                   (4 deferred policy questions)
+
+Codex adversarial review:
+  Two passes. Pass 1 (`codex-router-out/2026-05-11-dup-detection-review/`)
+  flagged a P0 lost-update race in the ledger and 4 correctness issues
+  including override + Layer B poisoning and in-memory rollback on
+  flush failure. Pass 2 (`codex-router-out/2026-05-12-dup-detection-
+  review-pass2/`) verified the fixes and caught 3 NEW correctness
+  issues: superseded rows could be resurrected by exact-hash re-arrival,
+  consume_override_and_insert didn't verify stage under the lock
+  (double-consume race), and some doc comments overstated find_by_hash
+  behavior. All pass-2 findings fixed before this entry shipped.
+
+Open policy questions (deferred to operator in To-Speak-About.txt):
+  - Daily duplicate-summary email recipient: same as Step 6's
+    notify_email(), or a separate ops-only address?
+  - Override CLI required-reason gating: keep `--reason` required
+    (current), or allow anonymous overrides for routine cases?
+  - Vendor name in the ledger: deferred. Currently not extracted.
+  - Stale-match surfacing: should very old matches (>18 months)
+    appear in a dedicated section of the daily summary email?
+
+No new .env keys. No changes to Steps 2 or 7. The
+`Inbox/duplicate_emails` subfolder is a new one-time operator setup.
+
+
+--------------------------------------------------------------------------
+0.8.0  —  2026-05-11  —  Step 1: Inbox-first recovery for unidentified invoices
+--------------------------------------------------------------------------
+Step 1 now identifies the Strata Plan from email subject, email body
+(bodyPreview), or PDF text inline — instead of leaving subject-only-
+unmatched emails for Step 3 to retry 20 minutes later. The downstream
+effect: unidentified emails STAY IN THE INBOX (not moved to
+`processed_emails`), so the operator's reply-to-self recovery workflow
+works the way it did in the N8n flow.
+
+Recovery workflow (documented in README "Recovery workflow" section and
+docs/client_training_brief.md):
+  1. Operator sees an unmatched email sitting in the Inbox.
+  2. Hits Reply. Changes To: from vendor's address to
+     `testinvsml@stratacomgmt.com`. Edits subject to include the strata
+     number. Sends. **No PDF re-attachment needed.**
+  3. Next morning Step 1 sees the reply, matches the subject, looks up
+     `conversationId` via Microsoft Graph, pulls the PDF from the
+     prior message in the thread, routes it, moves both messages to
+     `processed_emails`.
+
+Matching order (first hit wins, per Inbox message):
+  1. Subject  — `pick_from_subject(message.subject)`
+  2. Body     — `pick_from_subject(message.bodyPreview)` (first ~255
+                chars; full-body matching is a future enhancement)
+  3. PDF text — `match_from_pdf_text(extract_full_text(blob))` against
+                the in-memory PDF bytes
+  4. Conversation-link (only when subject/body matched + no attachments)
+     — walk `conversationId` newest-first, route from the first prior
+     message that has a routable PDF
+
+All-or-nothing rule for emails without a subject/body match:
+  - Every PDF must text-match a plan AND there must be no non-PDF/ZIP
+    attachments — only then do we route and move the email.
+  - Otherwise the entire email stays in the Inbox with nothing written
+    to disk. Honors "Inbox is the single source of truth" — we never
+    silently leave anything in `_Unmatched/` that the operator wouldn't
+    notice.
+
+Codex adversarial review caught and we fixed:
+  - Mixed matched/unmatched PDFs no longer cause silent data loss (the
+    initial fix saved unmatched PDFs to `_Unmatched/` but operators
+    don't check there, so we switched to true all-or-nothing).
+  - Unmatched non-PDF/ZIP-only emails no longer duplicate-save every
+    run (they stay in Inbox now, no disk write).
+  - Conversation-link now walks ALL priors newest-first looking for a
+    routable PDF, not just the most recent attachment-bearing one (the
+    most recent might have only a Word doc).
+  - Multiple corrected replies in the same run can't re-route the same
+    prior twice — `consumed_prior_ids` is tracked across the run and
+    excluded from the prior-finder.
+  - Conversation lookup failures are logged with conv_id context, not
+    silently swallowed.
+  - `_route_pdf` early-returns False (logged) if `plan_row.manager_name`
+    is empty, instead of raising and aborting the whole step.
+  - Multi-PDF prior messages log an error-level warning that all PDFs
+    are being routed to the reply's plan (so operator can spot a
+    misroute in the daily log).
+
+Known limitations (logged in To-Speak-About.txt for client direction):
+  - Multi-strata emails (one email containing PDFs for different
+    properties without any plan in subject/body): operator's reply-to-
+    self routes all PDFs to one strata; operator must manually
+    re-route misrouted invoices from the wrong manager's folder.
+  - ZIPs in unidentified emails: stay in Inbox, no auto-extraction.
+    Operator handles manually. Trade-off accepted to avoid duplicate-
+    save loop.
+  - bodyPreview is the first ~255 chars of the email body, not the
+    full body. Future enhancement: fetch full body + strip HTML.
+
+Code:
+  - tools/_lib/graph.py: `list_inbox_messages` now selects
+    `conversationId` and `bodyPreview` in `$select`. New helper
+    `list_conversation_messages(conversation_id)`.
+  - steps/step_1_intake.py: full restructure. New helpers
+    `_find_priors_with_attachments`, `_process_self_attachments`,
+    `_process_prior_attachments`, `_process_pdf_text_fallback`,
+    `_pick_plan`, `_route_pdf`.
+  - tests/test_plan_match.py: added `test_subject_breathing_room` —
+    locks in the spaces/hyphens/case tolerance the existing regex
+    already has (`BCS 2707`, `BCS-2707`, `bcs 2707`, `BCS  2707`, etc.
+    all resolve to BCS2707) plus negative cases.
+
+Step 3 keeps its existing logic — its workload shrinks because most
+single-PDF emails are now handled in Step 1. Its primary input going
+forward is ZIP-extracted PDFs from Step 2. A future consolidation
+that folds Steps 2 and 3 into Step 1 is noted in HANDOFF.md as a
+post-deployment opportunity (not now — current 6-step structure
+works and ships on time).
+
+Operator-facing docs updated:
+  README.md ("Recovery workflow — unidentified invoices" section +
+  troubleshooting), workflows/step_1_intake.md (full rewrite),
+  workflows/step_3_pdf_sort.md (clarify ZIP-extracted input),
+  HANDOFF.md (scanned-PDF caveat + future-optimization note),
+  docs/client_training_brief.md (Step 1 description, Recovery
+  Workflow, Roles at a Glance, Common Questions).
+
+No new .env keys. No changes to Steps 2 / 4 / 5 / 6 / 7. The
+`Inbox/processed_emails` subfolder remains a required setup step.
+
+
+--------------------------------------------------------------------------
+0.7.0  —  2026-05-11  —  Step 7: Monthly Invoice Aggregator
+--------------------------------------------------------------------------
+New monthly step. For each active strata plan, merges every Step-6-archived
+invoice from a target month into a single combined PDF and moves the source
+PDFs into a dated subfolder. End state per plan, per month: one clean
+`Summary - <MM> - <plan> <Month> <YYYY> inv.pdf` in the plan folder, plus
+an audit trail in `Strata_Plans/<plan>/Processed/<YYYY-MM>/`.
+
+Schedule:
+  Operator-chosen day in Task Scheduler (typically 5th–10th of the new
+  month). The script always aggregates the PREVIOUS calendar month by
+  default (America/Vancouver). `--month YYYY-MM` overrides; future months
+  and >24-mo-historical values are rejected before the per-step lock is
+  acquired.
+
+CLI:
+  python steps/step_7_aggregate.py                  # previous month, all plans
+  python steps/step_7_aggregate.py --month 2026-04  # explicit month
+  python steps/step_7_aggregate.py --plan BCS1234   # single plan
+  python steps/step_7_aggregate.py --dry-run        # write nothing
+  python steps/step_7_aggregate.py --force          # bypass ledger short-circuit
+
+Audit ledger (`_state/monthly_aggregations.csv`):
+  Single append-only CSV that records every (plan, target-month) attempt.
+  Step 7 consults the ledger before doing work and surfaces the count on
+  startup ("Ledger: 0 of 47 active plans aggregated for April 2026 — will
+  process all"). The ledger answers "did April actually finish for every
+  plan?" from one file and protects against accidental re-runs.
+
+  Statuses: `aggregated`, `aggregated_late`, `dry_run`,
+  `skipped_already_done`, `skipped_no_files`, `skipped_no_folder`, `error`.
+  `dry_run` is informational and explicitly does NOT count as done — a
+  follow-up real run still produces `aggregated`, not `aggregated_late`.
+
+Late-check semantics:
+  If Step 7 has already aggregated a month and a new invoice for that
+  month appears later (Step 6 archived it after Step 7 ran), the next
+  Step 7 run writes an additive `Summary - ... inv (1).pdf` rather than
+  overwriting the original. Ledger row: `aggregated_late`. Nothing is
+  silently dropped, nothing is silently overwritten. Whether the
+  destructive re-merge would be preferable is logged as a policy
+  question in `To-Speak-About.txt`.
+
+Idempotency:
+  Five rules consulted per plan after a candidate scan — see
+  `workflows/step_7_aggregate.md`. The two load-bearing ones:
+    1. Ledger says done + Summary file present + Processed/{YYYY-MM}/
+       populated → `skipped_already_done`.
+    2. Ledger says done + Summary OR Processed/ missing
+       → `error` (`ledger-filesystem disagreement`), refuse to process
+       until operator runs with `--force` after triage.
+
+  Rule 1 verifies the SUMMARY FILE is actually present, not just that
+  Processed/ has files — a deleted/corrupt Summary used to be silently
+  treated as done.
+
+Move-failure rollback:
+  If any source PDF fails to move into Processed/ (e.g. Acrobat has it
+  open with an exclusive lock), Step 7 rolls back the successful moves
+  AND deletes the just-written Summary. The plan goes back to a clean
+  "not done" state, ledger row is `error` with the failure details, and
+  the operator can investigate without producing a `Summary ... (1).pdf`
+  with duplicate pages on the next run.
+
+--force from Processed/:
+  When the plan-folder root is empty (operator deleted the Summary to
+  redo from scratch) AND `--force` is set, Step 7 falls back to scanning
+  `Processed/{YYYY-MM}/` for matching files and regenerates the Summary
+  from those. No move is performed since the files are already where
+  they belong. Ledger status: `aggregated_late` with notes mentioning
+  the source. Without this fix, `delete summary + run --force` produced
+  `skipped_no_files` and did nothing.
+
+Snapshot self-refresh:
+  Step 7 calls `refresh_snapshot()` at startup before
+  `require_fresh_snapshot()`. The monthly trigger may fire on days
+  Step 1's Mon–Fri schedule did not run (weekend, holiday). Refresh
+  failure is non-fatal as long as today's marker is present (no
+  regression on business-day runs).
+
+`--force` classification:
+  `--force` no longer suppresses the `aggregated_late` classification.
+  Once a (plan, month) has been aggregated, every subsequent run for
+  that pair is `aggregated_late`, regardless of whether `--force` was
+  needed to get there. Keeps the audit trail unambiguous: the FIRST
+  aggregation is `aggregated`; everything after is `aggregated_late`.
+
+Sort-key bucketing:
+  `_check_sort_key` now buckets alpha-prefixed checks ("AB-123",
+  "WIRE-9") separately from pure-numeric checks ("12345"). Pure-numeric
+  sort first by integer value; alpha-prefixed checks sort by prefix,
+  then by their internal number. Previously "AB-123" would sort at
+  integer position 123 among numeric checks — fine for purely-numeric
+  plans, wrong as soon as a strata mixes regular checks with wires.
+
+Parser hardening:
+  `parse_archive_filename()` defensively rejects names starting with
+  `Summary -`, `Processed -`, or `Paid -` so a permissive call site
+  can never accidentally re-aggregate Step 7's own output.
+
+Ledger zero-byte handling:
+  Ledger `append()` writes the CSV header when the file is missing OR
+  exists but is zero-bytes (Excel crash mid-save). Previously the first
+  data row would silently become the de-facto header.
+
+Dry-run email:
+  Dry-run sends a distinct "DRY RUN — Monthly aggregation" email subject
+  that lists which plans WOULD have been aggregated, instead of the
+  ambiguous "Monthly aggregation: 0 plans" message of a real-but-empty run.
+
+New code:
+  - steps/step_7_aggregate.py
+  - tools/_lib/pdf_merge.py
+  - tools/_lib/aggregation_ledger.py
+  - tools/_lib/plan_match.py: new `parse_archive_filename` (inverse of
+    Step 6's `_build_archive_name`)
+  - tools/_lib/paths.py: new `strata_plan_processed_month`,
+    `monthly_aggregations_csv`
+  - workflows/step_7_aggregate.md
+  - tests/test_aggregate_filename.py     (8 cases)
+  - tests/test_pdf_merge.py              (4 cases)
+  - tests/test_aggregation_ledger.py     (8 cases)
+  - tests/test_check_sort_key.py         (6 cases)
+
+End-to-end smoke (under .tmp/smoke_step7.py): nine cases covering dry-run,
+real run, idempotent re-run, late-check, Summary-missing detection,
+--force regeneration from Processed/, bad --month rejection, future
+--month rejection, and move-failure rollback (monkey-patched os.replace).
+All pass against a scratch STRATACO_ROOT.
+
+Post-Codex review hardening (same day, before any release): the rollback
+behaviour, Summary-existence check, --force-from-Processed fallback,
+snapshot self-refresh, sort-key bucketing, parser hardening, ledger
+zero-byte handling, and dry-run email phrasing were all added in response
+to an adversarial Codex review of the initial Step 7 implementation.
+See codex-router-out/2026-05-11-step7-review/ for the full review.
+
+No new .env keys. No changes to any of Steps 1–6.
+
+
+--------------------------------------------------------------------------
+0.6.0  —  2026-05-11  —  Strataplan_List.xlsx working-copy snapshot
+--------------------------------------------------------------------------
+Step 1 now refreshes `_state/strataplan_list_snapshot.xlsx` at 06:00 and all
+plan-consuming steps (1, 3, 4, 5, 6) read that snapshot instead of the master.
+The bundler reads the snapshot too, so diagnostic output matches what the day
+actually saw.
+
+The realistic baseline at 06:00 is that the operator left the master open in
+Excel from the previous day's editing session. The snapshot module reads the
+master via `CreateFileW` with `FILE_SHARE_READ | FILE_SHARE_WRITE |
+FILE_SHARE_DELETE` (via stdlib `ctypes`, no new dependency). Excel itself
+opens xlsx files with those share flags, so Windows allows a matching-share
+read through even while Excel holds the file. The bytes we read are whatever
+Excel last saved to disk; unsaved in-memory edits are invisible, which matches
+the "edit, save, close" protocol.
+
+Halt-on-failure: if Step 1's refresh fails for any reason (master missing,
+read error, bytes don't validate as XLSX), Step 1 returns 1 and the marker
+sidecar stays at yesterday (or is never written). Steps 3, 4, 5, 6 read the
+marker; if it's not today's date they refuse to run and surface
+`snapshot is not today's — refusing to run` in `daily_summary.csv`. Stale
+routing is unsafe — a re-routing on the spreadsheet (manager vacation, new
+AP) must take effect the same day, not the next. Step 2 (unzip) is
+independent of the snapshot and still runs.
+
+Verify-before-publish atomicity (post-review hardening):
+  The first iteration validated the snapshot AFTER atomic_write_bytes had
+  already replaced the previous file. A same-day re-run (testing today;
+  potential midday client re-run later) where the master had become corrupt
+  would have left bad bytes under a still-today marker, silently consumed by
+  steps 3-6. Fixed: refresh_snapshot() now stages bytes to
+  `<snapshot>.tmp.<pid>.xlsx`, runs openpyxl validation against the staged
+  file, only then os.replace()s into the published path, and rewrites the
+  marker last. A failed validation leaves the previous good snapshot intact.
+  Regression test in tests/test_strataplan_snapshot.py covers this exactly.
+
+Other post-review fixes:
+  - _verify_xlsx now has try/finally around wb.close() so a parse error
+    after a successful open doesn't leak the workbook handle on Windows.
+  - kernel32 is loaded with WinDLL(..., use_last_error=True) so a real
+    sharing violation or access-denied actually surfaces in the error
+    message rather than getting clobbered.
+  - tzdata pinned in requirements.txt — eliminates the silent fallback to
+    system local time if ZoneInfo("America/Vancouver") couldn't find the
+    timezone database on the deployment Python install.
+  - Stale-marker test now computes "yesterday" in Vancouver TZ, matching
+    what the production reader uses.
+
+Files:
+  - New: tools/_lib/strataplan_snapshot.py
+  - New: tests/test_strataplan_snapshot.py (7 unit tests, all passing,
+    including the verify-before-publish regression test)
+  - paths.py: strataplan_snapshot_xlsx(), strataplan_snapshot_marker() added
+  - Steps 1/3/4/5/6: load_plans() reads the snapshot path
+  - tools/collect_diagnostics.py: bundles the snapshot, surfaces marker date
+  - Diagnostics test fixture updated to seed _state/ snapshot + marker
+  - requirements.txt: tzdata added
+
+Manual verification on the deployment machine (Windows-only path):
+  1. Open Strataplan_List.xlsx in Excel and leave it open.
+  2. Run `python steps\step_1_intake.py` — refresh should succeed (this is
+     the load-bearing share-flag test).
+  3. Make an unsaved edit in Excel (do not save); re-run Step 1 — the
+     snapshot should not reflect the unsaved edit.
+  4. Rename the master to simulate a missing file; Step 1 returns 1 and
+     Step 3 halts with `snapshot is not today's`.
+
+
+--------------------------------------------------------------------------
+0.5.0  —  2026-05-11  —  Step 6 archive filename: client's date-bearing convention
+--------------------------------------------------------------------------
+Step 6 now writes archive filenames in the format the client asked for:
+
+    {check} - {MM} - {PLAN} {MonthName} {YYYY} inv.pdf
+    e.g.   12345 - 03 - BCS1234 March 2026 inv.pdf
+
+The original vendor filename is dropped from the archive name — every
+component is derived from values the accountant already enters on the
+Paid stamp (Check Number + Date) and values we already know
+(plan_norm, the normalised no-space form). Earlier steps and the
+`Processed - <original>.pdf` marker in the AP folder are unchanged —
+operators still recognise files at intermediate stages by the name
+they saw in their inbox.
+
+Date extraction is back. tools/_lib/stamp_read.py was stripped of date
+extraction in 0.1.4 because it grabbed vendor "Date:" labels in the
+invoice body and returned junk. Re-introducing it is safe now that
+0.3.0 narrowed the stamp search to the PAID region (`_locate_paid_region`)
+— the same protection that fixed Check Number extraction now protects
+the Date extraction. PaidStampValues gained `paid_date` and
+`has_paid_date` alongside `check_number`; the regex fallback uses the
+same ±300-char PAID-proximity guard.
+
+New helper `parse_paid_date(raw) -> (month, year) | None` accepts every
+format an accountant is likely to type:
+
+  * `MAY 08 2026` / `May 08 2026` — the default `render_paid_stamp`
+    output.
+  * `May 8, 2026` / `March 31 2026` — long-form with optional comma.
+  * `2026-05-08` — ISO; unambiguous.
+  * `MM/DD/YYYY` / `DD/MM/YYYY` — if one position exceeds 12, that's
+    the day; otherwise MM/DD/YYYY default.
+  * `MM/DD/YY` — REJECTED. 2-digit years are not guessed; the file
+    flags as unmatched instead.
+
+A new unmatched reason — "Could not read Date from Paid stamp" — joins
+the existing reasons in the Step 6 unmatched summary email. Same
+operator remediation as the Check Number row: open in Acrobat, confirm
+both fields show a value AND that the file is flattened.
+
+Critical: `_archive_one` and `_archive_exists_for` in
+steps/step_6_paid_archive.py now build the archive name through a
+single shared helper `_build_archive_name(check, month, year,
+plan_norm)`. If the two ever diverge, every previously-processed file
+in the AP folder would throw a false "stale processed marker" error,
+silently surfacing as unmatched. The helper keeps them locked.
+
+Existing archives sitting in `Strata_Plans/<plan>/` with the old
+`{check} - {original}` naming are untouched — the new convention only
+applies to files going forward. Renaming history would be a destructive
+irreversible operation and isn't part of this ask.
+
+Tests (tests/test_stamp_read.py extended; all 15 cases green):
+
+  - 11 unit cases for `parse_paid_date` covering every accepted format,
+    the day-first auto-detect (13/08/2026 → August), and the rejection
+    paths (empty, garbage text, 2-digit years).
+  - The three real mock invoices in reference/stamp_samples/ now round-
+    trip BOTH check number and date through `render_paid_stamp` →
+    manual-flatten (drawing the date value at row 0, check at row 1) →
+    `extract_paid_stamp_values` → `parse_paid_date`.
+  - The 0.3.0 decoy synthetic case was extended with a parallel
+    "Date: JAN 01 1999" label in the invoice header. The extractor
+    correctly returns the in-stamp `MAY 08 2026` and `55555`, proving
+    region narrowing protects the date the same way it protects the
+    check number.
+
+Files touched:
+  tools/_lib/stamp_read.py (re-introduced date extraction + parser),
+  steps/step_6_paid_archive.py (new name builder, missing-date
+  unmatched branch, reconcile path rewired),
+  workflows/step_6_paid_archive.md (objective, outputs, unmatched
+  reasons, operator guidance),
+  tests/test_stamp_read.py (date round-trip + decoy + parse unit
+  tests), VERSION, ReleaseNotes.txt.
+
+
+--------------------------------------------------------------------------
+0.4.2  —  2026-05-11  —  Diagnostic bundler for cross-machine troubleshooting
+--------------------------------------------------------------------------
+Added `tools/collect_diagnostics.py`. The deployment machine doesn't have
+Claude Code / VS Code; this bundler produces a single self-contained zip
+the operator can move to a dev box for a remote AI assistant to inspect
+the pipeline's full state across all six steps.
+
+What the bundle captures (no PDF contents — listings only):
+
+  - SUMMARY.md           — human-readable index + queue counts + lockfile
+                           status + today's daily_summary.csv rows + last
+                           30 lines of each step_N_<today>.log + pointers
+                           toward steps with status=error/skipped.
+  - VERSION, system.txt, pip_freeze.txt, env_check.txt (SET/MISSING per
+    env var; values never recorded).
+  - Strataplan_List.xlsx — copy of the master plan list (escape hatch:
+                           --no-strataplan).
+  - logs/                — daily_summary.csv + last N days of step logs
+                           (default 7, --days N to override) + any
+                           .step_N.lock files present.
+  - queues/              — TSV listings of _Unmatched/Invoices, every
+                           manager's To_Approve/Approved folders, every
+                           AP's Approved_Invoices/Paid_Invoices folders,
+                           and last 30 days of Strata_Plans/ (capped 500).
+  - state/               — TSV listings of _state/toapprove_history and
+                           _state/ap_approved_history.
+
+Soft-fails when STRATACO_ROOT or Strataplan_List.xlsx is missing — the
+zip still gets written with system metadata + env_check, so the operator
+can see why. The script never adds a row to daily_summary.csv and never
+acquires a step lockfile (it's on-demand, not a scheduled step).
+
+CLI:
+  python tools/collect_diagnostics.py [--days N] [--out PATH] [--no-strataplan]
+
+New test (all green): tests/test_collect_diagnostics.py — happy-path
+bundle includes expected files, --no-strataplan excludes the XLS,
+missing STRATACO_ROOT still produces a usable bundle, env_check never
+leaks env-var VALUES.
+
+HANDOFF.md gained a "Deferred: Strataplan_List.xlsx working-copy
+pattern" note. Krisztian raised the concern during the bundler review:
+even though openpyxl is read-only (and can't corrupt the master file),
+two operational risks remain — Attila opening the XLS in Excel takes
+an exclusive lock that crashes a step, and mid-day edits would have
+different steps in one morning seeing different routing rules. Fix
+sketched out: a `_state/strataplan_list_snapshot.xlsx` working copy
+that the steps read; deferred as a separate change before 1.0.0.
+
+Files added: tools/collect_diagnostics.py,
+tests/test_collect_diagnostics.py.
+
+Files touched: README.md (new "Generating a diagnostic bundle" section
+under Troubleshooting), HANDOFF.md (deferred snapshot note), VERSION,
+ReleaseNotes.txt.
+
+
+--------------------------------------------------------------------------
+0.4.1  —  2026-05-11  —  Client training brief
+--------------------------------------------------------------------------
+Added docs/client_training_brief.md — a plain-language document that
+follows the life of an invoice through all six steps, written for
+managers and accountants rather than developers. Covers what the system
+does at each stage, what human action is required, timing references,
+common edge-case questions, and a ready-to-paste design prompt for
+turning the brief into a visual swimlane diagram using Claude.ai or
+any AI design tool (Canva, Google Slides, etc.).
+
+No code, workflow, or configuration files were changed.
+
+Files added: docs/client_training_brief.md.
+
+
+--------------------------------------------------------------------------
+0.4.0  —  2026-05-11  —  Codex review fixes, batch 3 (step entry-points)
+--------------------------------------------------------------------------
+Third and final batch from the 2026-05-10 Codex P0/P1 fix pass. Wires
+every step entry-point to the helpers added in batches 1 and 2, closes
+the remaining P0/P1 findings, and adds the last of the regression tests.
+
+Findings closed (8):
+
+  - P0 #2 (apply): every step entry-point that writes a destination
+    file now uses safe_io.safe_write_unique() instead of the bare
+    atomic_write_bytes(), so a duplicate filename from a different
+    vendor uniquifies with " (1)" / " (2)" instead of overwriting.
+    Applies to: step_1 attachment saves, step_2 zip extraction
+    promote, step_3 stamped-PDF write + processed marker, step_5 AP
+    transfer + processed marker, step_6 archive write + processed
+    marker.
+  - P0 #4 (apply): step_6 no longer hardcodes attila@ati-netwks.ca
+    as the summary recipient. Reads config.notify_email(), which
+    resolves NOTIFY_OVERRIDE_EMAIL during shadow and falls back to
+    the new required NOTIFY_DEFAULT_EMAIL post-cutover. Local
+    filesystem paths (`sourceFullPath`) removed from both processed
+    and unmatched summary email bodies — no operator-side filesystem
+    detail leaks downstream.
+  - P0 #5: step_2 gained zip-bomb pre-flight via new _audit_zip().
+    Per-zip checks: encrypted entries (refuse — no password handling
+    by design), entry count (default 200 max), per-entry uncompressed
+    size (100 MB default), uncompressed-to-compressed ratio (100×
+    default), and total uncompressed bytes (500 MB default). All
+    knobs exposed as .env vars (ZIP_MAX_ENTRIES, ZIP_MAX_UNCOMPRESSED_
+    BYTES, ZIP_MAX_TOTAL_BYTES, ZIP_MAX_RATIO). Rejected archives are
+    left in place without the Processed- rename so a human can
+    investigate.
+  - P1 #4 (apply): step_3 now calls the new
+    plan_match.match_from_filename_with_base_fallback(). Workflow's
+    base-plan-when-variants-share-manager promise (LMS 4193 →
+    LMS 4193A/B sharing one manager) finally delivered. When the
+    fallback fires the routed filename keeps the operator's BASE plan
+    string, not the picked variant.
+  - P1 #9: step_3, step_5, and step_6 reorder the mark-processed
+    flow. Old code shared one try-block for "write Processed marker
+    AND delete original" — a partial-success could delete the
+    original even though the marker write failed. Now the unlink only
+    runs after the marker write returns successfully; if the marker
+    fails, the source PDF stays in place and the next run retries.
+    The destination write happens first, so retries are idempotent.
+  - P1 #10: step_6 reconciles stale Processed counterparts. When the
+    AP's Paid_Invoices folder shows a `Processed - <name>` file, we
+    now look up `Strata_Plans/<plan>/<check> - <name>(*)` and only
+    skip silently when an archive is actually present. Missing
+    archive surfaces as unmatched with reason "Processed marker
+    present but archive missing — investigate before re-running" so
+    the operator can recover instead of losing the file.
+  - P1 #11 (apply): step_4 and step_5 wired up to the scanned/
+    notified baseline split from 0.3.0. The diagnostic "scanned"
+    snapshot still rolls forward on every run; the "notified"
+    baseline only advances after the send_mail call returns. A failed
+    send no longer ages unsent invoices from "new" to "old" — they
+    stay in the "new" bucket until they actually get emailed.
+  - P1 #13: step_1 no longer drops non-PDF/ZIP attachments. The
+    outer filter now keeps every real file attachment (per
+    workflows/step_1_intake.md). PDFs that match a plan still get
+    stamped and routed to the manager; everything else lands in
+    _Unmatched/Invoices/ where the operator can sort it. Item /
+    reference attachments (pointers to other Graph objects) are
+    still skipped — they're not downloadable files.
+  - P1 #14: step_2 extracts to a per-zip staging directory
+    (_Unmatched/.staging/<zip>-<timestamp>/) and only promotes to
+    _Unmatched/Invoices/ once every entry succeeded. Per-entry
+    failures abort the whole archive (don't leave partial state) and
+    leave the source ZIP without the Processed- rename so the
+    operator can investigate.
+
+Carryover from batch 1 — caller-side skipped-run guard:
+
+  Every step's main() now starts with
+    `if run.status == "skipped": return 0`
+  so the daily_log lock-collision branch (yielded as a skipped run in
+  0.2.0) actually short-circuits the body instead of executing it.
+  Without this guard, an overlapping scheduled run would still do all
+  the work even after acquiring the "skipped" status — making the
+  per-step lockfile pointless.
+
+New tests (all green):
+
+  - tests/test_zip_safety.py — synthetic ZIPs exercising each
+    _audit_zip rejection path: too many entries, encrypted (flag bit
+    forced via byte-patch since stdlib zipfile can't write real
+    encrypted entries), oversized entry (with env override to bring
+    the cap to 5 bytes), and high compression ratio (lots of zeros).
+    Plus the happy-path "small PDF" case to confirm legitimate ZIPs
+    still pass.
+
+Test status across all batches: 8 test files, ~22 suites, all green.
+Step entry-points all import cleanly.
+
+Operational testing per HANDOFF.md:47-55 still pending — that requires
+a real STRATACO_ROOT and Azure credentials, which aren't available in
+the dev environment yet. Real-data plan-match validation per
+HANDOFF.md:84 still gates anything in To-Speak-About.txt.
+
+Files touched:
+  steps/step_1_intake.py, steps/step_2_unzip.py,
+  steps/step_3_pdf_sort.py, steps/step_4_pending_email.py,
+  steps/step_5_to_ap.py, steps/step_6_paid_archive.py,
+  tools/_lib/config.py (zip-safety knobs), .env.example (zip knobs +
+  NOTIFY_DEFAULT_EMAIL note), VERSION, ReleaseNotes.txt. Added
+  tests/test_zip_safety.py.
+
+
+--------------------------------------------------------------------------
+0.3.0  —  2026-05-11  —  Codex review fixes, batch 2 (cross-cutting library)
+--------------------------------------------------------------------------
+Second of three batches addressing the Codex P0/P1 findings. This
+batch lands library-level fixes that span multiple steps. Steps still
+call the legacy entry points where applicable; batch 3 wires them to
+the new variants. Plan file:
+~/.claude/plans/i-want-you-to-polished-dragonfly.md.
+
+Findings closed (6 directly; 1 P2 bonus):
+
+  - P1 (a): subject-line plan normalisation in
+    tools/_lib/plan_match.py:subject_candidates(). Pre-fix produced
+    "BCSA2707" for "BCS 2707A" (suffix-before-digits); now produces
+    "BCS2707A" matching PlanRow.plan_norm so the lookup actually
+    hits. One-character ordering fix in the f-string.
+  - P1 (b): no-digit plans (e.g. GVCCA, TCLUB) can now match in
+    match_from_pdf_text. The regex at the digit-bearing pass
+    silently continued past those rows, leaving plan_to_row missing
+    them and the no-digit handler iterating over an empty set.
+    No-digit plans are now indexed in a dedicated pass ahead of
+    the digit-bearing one. Enables the existing dead-code matcher
+    rather than altering the protected scoring core.
+  - P1 (e): new function
+    plan_match.match_from_filename_with_base_fallback(). Implements
+    what workflows/step_3_pdf_sort.md already promised: when the
+    filename gives a base plan (e.g. "LMS 4193") and the XLS only
+    knows the suffixed variants (LMS 4193A, LMS 4193B) sharing one
+    manager, route by that manager. The returned PlanRow rewrites
+    plan_norm to the BASE so the caller stamps the file with what
+    the operator actually wrote — not an auto-picked variant.
+    Step 3 picks this up in batch 3.
+  - P1 (#2, #3): Microsoft Graph wrapper hardening in
+    tools/_lib/graph.py.
+      • New _get_paged_value() follows @odata.nextLink so calls past
+        the first page no longer get silently dropped.
+        list_inbox_messages + list_attachments use it.
+      • Every UPN / message-id / attachment-id / folder name path
+        segment is now urllib.parse.quote()-escaped via a new _q()
+        helper. Prevents IDs containing + / = (Graph emits base64url
+        IDs) from corrupting the URL.
+      • find_child_folder_id now escapes single quotes inside the
+        OData $filter literal per the OData v4 spec ('→'').
+  - P1 (#8): Check Number extraction in tools/_lib/stamp_read.py is
+    now restricted to the Paid stamp region. Logic:
+      1. Find the "PAID" header word on page 1.
+      2. Bound the search to ±(STAMP_WIDTH/2 + 24pt) around its
+         centre and STAMP_HEIGHT_PAID + 24pt below.
+      3. Run the existing label-finder + regex inside that box.
+      4. If "PAID" can't be located, fall back to whole-page search
+         with a warning + a note in PaidStampValues.
+      5. The regex fallback (over full text) now requires "PAID" in
+         a ±300-char window around the match, so a vendor invoice's
+         own "Check Number:" field can't be mistaken for the stamp.
+    Verified against the three real mock invoices + a new
+    decoy-on-header synthetic test (returns the stamp's 55555, not
+    the header's 99999).
+  - P1 (#11): history baseline split in tools/_lib/history.py. New
+    helpers read_notified_for_manager + write_scanned_for_manager +
+    write_notified_for_manager (and the parallel AP set). The
+    "scanned" snapshot still rolls forward unconditionally for
+    diagnostics; "notified" only advances after a successful email
+    send. Tomorrow's diff reads notified, so a failed send no longer
+    silently ages an unsent invoice from "new" into "old". Each
+    reader falls back to the pre-split combined file on first run.
+    Steps 4 and 5 still call the legacy entry points; batch 3 wires
+    them to the new helpers.
+
+P2 bonus (fixed while in the area, blocked the history tests):
+
+  - tools/_lib/history.py:_read_invoice_column now loads the
+    workbook via io.BytesIO so openpyxl's filename-extension check
+    can't refuse our XLSX-content-in-.xls-named files. The files
+    are XLSX format internally; the .xls naming is a carryover from
+    the original N8n flow. Read path is now extension-agnostic.
+
+Convention (new): To-Speak-About.txt.
+
+  - Added a section to CLAUDE.md ("Policy vs bug — when to defer to
+    To-Speak-About.txt") establishing a standing rule: when a code
+    decision is really a policy / workflow / naming / data-
+    interpretation question, don't pick an answer unilaterally —
+    log it in To-Speak-About.txt for Krisztian to discuss with his
+    dad / the client. Bug fixes proceed normally.
+  - Seeded To-Speak-About.txt with the two HANDOFF-protected
+    plan_match findings from the 2026-05-10 Codex review that this
+    convention is exactly designed to handle:
+      • Issue C: should match_from_pdf_text count the base every
+        time the suffix matches, or only when the regex didn't
+        capture a suffix?
+      • Issue D: when a PDF says "BCS 2707" and the XLS only has
+        BCS 2707A/B, should the routed file be labelled with the
+        base (operator's intent) or with the picked variant?
+    Both are inside the HANDOFF.md:98-101 protected zone; final
+    answers gate on real-data validation per HANDOFF.md:84.
+
+New tests (all green):
+
+  - tests/test_plan_match.py — (a) subject normalisation,
+    (b) no-digit plan match, (e) filename base fallback.
+  - tests/test_graph.py — URL quoting of UPN/IDs, OData single-quote
+    escape, _get_paged_value follows nextLink and drops the params
+    on follow-ups.
+  - tests/test_history_split.py — read_notified falls back to
+    legacy; simulating a send failure keeps the invoice "new" on
+    day 2 and lets it age to "old" only after day 2's send
+    succeeds; AP split helpers behave identically.
+  - tests/test_stamp_read.py extended — new "decoy" synthetic case
+    that puts a literal "Check Number: 99999" in the invoice
+    header outside the stamp region. Extractor must return the
+    stamp's 55555.
+
+Files touched:
+  tools/_lib/plan_match.py, tools/_lib/graph.py,
+  tools/_lib/stamp_read.py, tools/_lib/history.py,
+  tools/_lib/paths.py (added split-baseline file paths), CLAUDE.md,
+  VERSION, ReleaseNotes.txt. Added To-Speak-About.txt,
+  tests/test_plan_match.py, tests/test_graph.py,
+  tests/test_history_split.py, and extended tests/test_stamp_read.py.
+
+Step entry points still pending in batch 3:
+  apply safe_write_unique, swap to the new history helpers, gate
+  baseline writes on send success, replace step 6's hardcoded
+  recipient, add the zip-bomb guards, etc.
+
+
+--------------------------------------------------------------------------
+0.2.0  —  2026-05-11  —  Codex review fixes, batch 1 (foundation)
+--------------------------------------------------------------------------
+First of three batches addressing the P0 + P1 findings from the
+2026-05-10 Codex adversarial review (see
+codex-router-out/2026-05-10-full-codebase-review/codex-review.md). This
+batch lands the foundation helpers so batches 2 and 3 can build on
+them. Plan file: ~/.claude/plans/i-want-you-to-polished-dragonfly.md.
+
+Findings closed (5):
+  - P0 #1: daily_log contextmanager bug (tools/_lib/log.py). The
+    lock-collision branch used `return` before `yield`, which raises
+    RuntimeError: generator didn't yield in any caller. Rewrote to
+    yield a `_Run` with status="skipped" and short-circuit. Callers
+    should bail at the top of main() when run.status == "skipped"
+    (those caller-side checks land in batch 3).
+  - P0 #2 (helpers): new tools/_lib/safe_io.safe_write_unique(). When
+    the target exists, uniquifies with ` (1)`, ` (2)`, … instead of
+    silently overwriting via os.replace. Existing atomic_write_bytes
+    stays as the bare primitive; safe_write_unique wraps it. Steps
+    pick this up in batch 3.
+  - P0 #3 (helpers + apply at the path layer): new
+    sanitize_path_component() and assert_under_root() in safe_io.
+    paths.py now funnels every manager/AP/plan path through them so a
+    bad name in Strataplan_List.xlsx can never escape STRATACO_ROOT.
+    Also blocks Windows reserved device names (CON, PRN, COM1, etc.).
+  - P0 #4 (helper): new config.notify_email() that resolves to
+    NOTIFY_OVERRIDE_EMAIL when set, else NOTIFY_DEFAULT_EMAIL (newly
+    required env var documented in .env.example). Step 6's hardcoded
+    "attila@ati-netwks.ca" gets removed in batch 3 once this is wired.
+  - P1 #12: xls.load_plans() now validates manager/AP names through
+    sanitize_path_component and runs a new _check_duplicate_routing
+    pass that raises when two active rows share a plan_norm but
+    disagree on manager/AP. The old silent setdefault() behaviour was
+    masking data-entry errors.
+
+New tests (standalone, run with `python tests/test_*.py`):
+  - tests/test_safe_io.py — sanitization rejects ..-traversal, drive
+    letters, separators, reserved names; assert_under_root rejects
+    escape attempts; safe_write_unique uniquifies in place.
+  - tests/test_log.py — holding the per-step lockfile externally,
+    daily_log yields a skipped run instead of raising RuntimeError.
+  - tests/test_xls.py — _check_duplicate_routing raises on conflicts,
+    stays silent on legitimate duplicates and inactive rows;
+    _validate_component re-raises sanitization errors with row
+    context.
+
+.env update:
+  - NOTIFY_DEFAULT_EMAIL is now a required env var (it defaults to
+    attila@ati-netwks.ca in .env.example to match the existing shadow
+    setup, but the code refuses to fall back to a hardcoded address).
+
+Deferred to batch 2 (cross-cutting library) and batch 3 (step
+entry-points) — see the plan file for the rest.
+
+Files touched:
+  tools/_lib/log.py, tools/_lib/safe_io.py, tools/_lib/paths.py,
+  tools/_lib/config.py, tools/_lib/xls.py, .env.example, VERSION,
+  ReleaseNotes.txt. Added tests/test_safe_io.py, tests/test_log.py,
+  tests/test_xls.py.
+
+
+--------------------------------------------------------------------------
+0.1.4  —  2026-05-10  —  Cleanup + first regression test
+--------------------------------------------------------------------------
+- Cleaned reference/stamp_samples/python_renders/. Removed 7 stale mock
+  renders left over from the v0.1.2 placement-tuning round; only the two
+  current example PDFs remain (example_received_stamp.pdf and
+  example_paid_stamp.pdf), regenerated against the v0.1.3 algorithm.
+- New tests/test_stamp_read.py — first regression test in the project.
+  Synthesizes a busy invoice in memory, applies the Paid stamp, draws
+  Date and Check Number values at the AcroForm field coordinates to
+  mimic what Print-to-PDF flattening produces, and verifies that
+  tools/_lib/stamp_read.py:extract_paid_stamp_values reads them back
+  correctly. Standalone (no pytest dependency) — run with
+  `python tests/test_stamp_read.py`. Catches regressions in
+  pdfplumber-based positional word matching, the label/value baseline
+  search, and the regex fallback path.
+- HANDOFF.md gained a "Tests to run when real data arrives" section
+  (plan-match accuracy, real-invoice stamp positioning, real flattened
+  Paid stamp round-trip, live cutover sequence).
+- Removed dead code: the `date` field on `PaidStampValues` and its
+  extraction logic in tools/_lib/stamp_read.py. The Paid stamp's date is
+  written by hand by the accountant and never read back by any step —
+  Step 6 only consumes `check_number`. The original spec
+  (reference/Things to Change to current Flows.txt) only ever asked for
+  the check-number prefix. Removing it also gets rid of a latent bug
+  where invoices with their own "Date:" / "Invoice Date:" labels (e.g.
+  the cascade and northshore mocks) would return the body's date
+  instead of the stamp's.
+- The smoke test runs against the three real mock invoices in
+  reference/stamp_samples/ when present, falling back to a synthesized
+  in-memory invoice otherwise. All three mocks return their expected
+  check numbers.
+
+Files touched: VERSION, ReleaseNotes.txt, HANDOFF.md,
+tools/_lib/stamp_read.py, and added tests/test_stamp_read.py. Removed
+seven *.pdf files under reference/stamp_samples/python_renders/.
+
+
+--------------------------------------------------------------------------
+0.1.3  —  2026-05-09  —  Stamp page-edge margin + tie-break sanity
+--------------------------------------------------------------------------
+- New PAGE_MARGIN_PT constant (36pt = 0.5 inch) in tools/_lib/stamp.py.
+  The stamp bounding box is never placed inside the margin — keeps stamps
+  off the physical page edge in case of print/save quirks AND prevents the
+  algorithm from clustering stamps right next to bottom-of-page footers.
+- find_largest_whitespace_box scoring is now pure "cleanest area wins"
+  (no positional bias term). Among equally-clean candidates the LAST one
+  encountered in the scan wins (changed > to >=) — and since the search
+  scans top-to-bottom and left-to-right, that's the bottom-right tied
+  spot. Matches the conventional "stamps go below the content" look
+  without overriding genuinely cleaner spots elsewhere.
+- Verified against all three mock invoices in reference/stamp_samples/:
+  Cascade, Westshore, Northshore. Both stamps now sit in the lower half
+  with proper margin, and don't overlap each other or any hard-rule field
+  (subtotal / total / tax / line items / invoice number).
+
+Files touched: tools/_lib/stamp.py.
+
+
+--------------------------------------------------------------------------
+0.1.2  —  2026-05-08  —  Paid stamp caps + placement refinement
+--------------------------------------------------------------------------
+- Paid stamp header now reads "PAID" in all caps (was "Paid").
+- Placement algorithm in tools/_lib/stamp.py:find_largest_whitespace_box
+  rewritten to never land on subtotal / VAT / total / line items / invoice
+  number rows:
+    * WHITE_PCT_MIN tightened 0.985 -> 0.995.
+    * New per-row whitespace check (PER_ROW_WHITE_PCT_MIN = 0.95): every
+      pixel row inside the candidate window must be at least 95% white.
+      Catches "horizontal line of text running through the area" — exactly
+      what the totals row looked like.
+    * Removed the right-side x-bias that was pulling the stamp toward the
+      totals column.
+    * y-bias reduced 0.5 -> 0.1 (small lower-half tiebreaker, no longer
+      dominant).
+    * Two-tier fallback: strict pass first (0.995 + per-row check); loose
+      pass (0.985 only) if strict finds nothing, so dense invoices still
+      get placed instead of falling to fixed coords. The chosen tier is
+      logged.
+- Example renders regenerated under reference/stamp_samples/python_renders/.
+  Both Paid and Received now land in the lower-left clear area on the
+  sample invoice.
+
+Files touched: tools/_lib/stamp.py.
+
+
+--------------------------------------------------------------------------
+0.1.1  —  2026-05-08  —  Paid stamp visual refresh
+--------------------------------------------------------------------------
+- Paid stamp header "Paid" now renders as a centered title (Helvetica-Bold
+  22pt) above the body, with no border around it. The bordered rectangle
+  wraps only the editable Date and Check Number rows.
+- Stamp rendering generalized: any header-only Row (both `fixed_value` and
+  `field_name` are None) is now treated as a centered title above the body
+  box. The Received stamp is unaffected because it has no header-only rows.
+- Paid stamp height bumped 90pt -> 100pt to give the title room.
+- Re-rendered reference/stamp_samples/python_renders/example_paid_stamp.pdf.
+
+Files touched: tools/_lib/stamp.py.
+
+
+--------------------------------------------------------------------------
+0.1.0  —  2026-05-08  —  Initial Python scaffold (pre-deployment)
+--------------------------------------------------------------------------
+First end-to-end Python port of the six N8n workflows, ready for testing
+once Azure credentials and STRATACO_ROOT are wired up on the dev/deploy
+machine.
+
+Built:
+  - Six entry-point scripts under steps/ (one per Task Scheduler job).
+  - Shared library under tools/_lib/ (config, graph, xls, plan_match,
+    pdf_text, stamp, stamp_read, history, log, paths, safe_io).
+  - Six SOPs under workflows/.
+  - Reference folder with the original N8n .json exports, the docx
+    overview, the change-request .txt, and a sample stamped PDF.
+  - Per-step daily logs + rolling daily_summary.csv with file-locked
+    appends.
+
+New behaviour vs. the N8n flows:
+  - Step 5: drops the "Approved - " prefix when copying to the AP folder
+    and applies an editable Paid stamp (blue, two AcroForm text fields).
+  - Step 6: processes every PDF in Paid_Invoices (no "Paid -" filter),
+    reads the Check Number from the flat PDF, and prefixes the destination
+    filename with it.
+
+Stamp module:
+  - Re-implemented from scratch (no dependency on the 192.168 service).
+  - Whitespace placement via numpy integral-image search, lower-right bias.
+  - Received stamp: red, 7 rows, 2 fixed (date, plan) + 5 editable AcroForm
+    fields (gl_code, chargeback, chargeback_to, amount, approved).
+  - Paid stamp: blue, 3 rows, header "Paid" + 2 editable fields (date,
+    check_number).
+
+Concurrency safety:
+  - Atomic writes (.tmp.<pid> + os.replace) for every PDF/XLS the steps
+    produce.
+  - Per-step lockfiles via portalocker prevent a step from racing itself.
+  - Schedule stagger preserved (06:00 / 06:10 / 06:20 / 06:30 / 06:40 /
+    07:00, Mon-Fri).
+
+Notifications:
+  - All manager/AP emails routed to NOTIFY_OVERRIDE_EMAIL during the
+    shadow phase. Override defaults to attila@ati-netwks.ca.
+
+Not yet done in 0.1.0 (see HANDOFF.md):
+  - .env not populated (no real Azure app reg).
+  - STRATACO_ROOT not pointed at the production folder tree.
+  - Stamp visual placement not tuned against real-volume invoices.
+  - Task Scheduler jobs not registered.

@@ -1,0 +1,327 @@
+"""Unit tests for tools/_lib/plan_match.py — the changes shipped in 0.3.0.
+
+Covers the three plan_match fixes Krisztian green-lit out of the Codex
+review (the other two — suffix double-count and base-fallback display —
+went into To-Speak-About.txt as policy questions):
+
+  (a) subject_candidates() normalisation now builds "BCS2707A", not
+      the pre-fix "BCSA2707".
+  (b) match_from_pdf_text() can match no-digit plans (GVCCA, TCLUB)
+      that the pre-fix code silently dropped from `plan_to_row`.
+  (e) match_from_filename_with_base_fallback() implements the
+      base-plan-when-variants-share-manager rule the Step 3 workflow
+      already promised but the code wasn't delivering.
+
+Standalone: no pytest dependency. Run with `python tests/test_plan_match.py`.
+Exits 0 on success, 1 on failure.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from tools._lib.plan_match import (
+    match_from_filename_with_base_fallback,
+    match_from_pdf_text,
+    pick_from_subject,
+    plan_base,
+    subject_candidates,
+)
+from tools._lib.xls import PlanRow
+
+
+def _row(plan_norm: str, manager: str = "Sue Smith", ap: str = "Alex AP",
+         strata_name: str = "", active: bool = True) -> PlanRow:
+    return PlanRow(
+        plan_norm=plan_norm,
+        plan_raw=plan_norm,
+        strata_name=strata_name,
+        address="",
+        manager_name=manager,
+        manager_key=manager.upper().replace(" ", "_"),
+        manager_email="",
+        ap_name=ap,
+        ap_key=ap.upper().replace(" ", "_"),
+        ap_email="",
+        status_active=active,
+    )
+
+
+def test_subject_normalization() -> list[str]:
+    failures: list[str] = []
+
+    cases = [
+        ("Invoice for BCS 2707A", "BCS2707A"),
+        ("BCS-2707 attached", "BCS2707"),
+        ("LMS 4193C — please review", "LMS4193C"),
+        ("EPS 6763", "EPS6763"),
+    ]
+    for subject, expected in cases:
+        cands = subject_candidates(subject)
+        norms = [c.norm for c in cands]
+        if expected not in norms:
+            failures.append(
+                f"[normalize '{subject}'] expected {expected!r} among candidates, got {norms}"
+            )
+
+    # Pre-fix bug would have produced "BCSA2707" for "BCS 2707A".
+    cands = [c.norm for c in subject_candidates("BCS 2707A")]
+    if "BCSA2707" in cands:
+        failures.append("[normalize bug check] still producing pre-fix 'BCSA2707'")
+
+    # Full round-trip through pick_from_subject against a plan_map.
+    plan_map = {"BCS2707A": _row("BCS2707A")}
+    sc, row = pick_from_subject("Inv for BCS 2707A pls approve", plan_map)
+    if row is None or row.plan_norm != "BCS2707A":
+        failures.append(
+            f"[pick_from_subject 'BCS 2707A'] expected BCS2707A row, got {row}"
+        )
+
+    return failures
+
+
+def test_no_digit_plan_matches_pdf_text() -> list[str]:
+    failures: list[str] = []
+
+    rows = [
+        _row("GVCCA", manager="Sue Smith", strata_name="Granville CCA"),
+        _row("BCS2707", manager="Jane Doe", strata_name="Some Other Plan"),
+    ]
+    text = (
+        "Invoice from ACME Corp. Strata GVCCA at 123 Main St. "
+        "Total $250.00. Please remit by month-end."
+    )
+    result = match_from_pdf_text(text, rows)
+    if result.plan_norm != "GVCCA":
+        failures.append(
+            f"[no-digit GVCCA] expected plan_norm=GVCCA, got {result.plan_norm!r} "
+            f"(note={result.note!r})"
+        )
+
+    # Negative case: text doesn't mention any plan → no match.
+    result_neg = match_from_pdf_text("Random invoice with no plan", rows)
+    if result_neg.plan_row is not None:
+        failures.append(
+            f"[no-digit negative] expected no match, got {result_neg.plan_norm!r}"
+        )
+
+    return failures
+
+
+def test_subject_breathing_room() -> list[str]:
+    """Locks in the spaces/hyphens/case tolerance the matcher already has.
+
+    Operators sometimes type strata numbers as 'BCS-2707' or 'BCS  2707' or
+    'bcs2707' by accident. norm_plan() + the subject regex are forgiving by
+    design — this test makes sure a future refactor can't quietly regress
+    that without one of these failing.
+    """
+    failures: list[str] = []
+
+    plan_map = {
+        "BCS2707": _row("BCS2707"),
+        "NW567": _row("NW567"),
+        "LMS4193A": _row("LMS4193A"),
+        "GVCCA": _row("GVCCA"),
+    }
+
+    bcs_variants = [
+        "Invoice from Acme BCS 2707 attached",
+        "Invoice from Acme BCS  2707 attached",  # double space
+        "Invoice from Acme BCS2707 attached",     # no space
+        "Invoice from Acme BCS-2707 attached",    # hyphen
+        "Invoice from Acme BCS - 2707 attached",  # space-hyphen-space
+        "Invoice from Acme BCS_2707 attached",    # underscore
+        "Invoice from Acme bcs 2707 attached",    # lowercase
+        "Invoice from Acme BCS#2707 attached",    # hash
+        "Invoice from Acme BCS:2707 attached",    # colon
+        "Invoice from Acme BCS/2707 attached",    # slash
+    ]
+    for subject in bcs_variants:
+        _, row = pick_from_subject(subject, plan_map)
+        if row is None or row.plan_norm != "BCS2707":
+            failures.append(
+                f"[breathing room BCS 2707] {subject!r} → "
+                f"{row.plan_norm if row else None!r} (expected BCS2707)"
+            )
+
+    # 2-letter prefix still works
+    _, row = pick_from_subject("Re: NW 567 invoice", plan_map)
+    if row is None or row.plan_norm != "NW567":
+        failures.append(
+            f"[breathing room 2-letter] 'NW 567' → "
+            f"{row.plan_norm if row else None!r} (expected NW567)"
+        )
+
+    # Suffix with hyphen
+    _, row = pick_from_subject("LMS-4193A invoice", plan_map)
+    if row is None or row.plan_norm != "LMS4193A":
+        failures.append(
+            f"[breathing room suffix] 'LMS-4193A' → "
+            f"{row.plan_norm if row else None!r} (expected LMS4193A)"
+        )
+
+    # Reversed / malformed inputs SHOULD NOT match — guard against false positives
+    bad_inputs = [
+        "Invoice 2707 BCS",            # digits before letters
+        "Invoice B2C7S0707",            # interleaved
+        "Invoice from 12345 someone",   # no letter prefix
+    ]
+    for subject in bad_inputs:
+        _, row = pick_from_subject(subject, plan_map)
+        if row is not None:
+            failures.append(
+                f"[breathing room negative] {subject!r} unexpectedly matched "
+                f"{row.plan_norm!r} — matcher is too loose"
+            )
+
+    return failures
+
+
+def test_filename_base_fallback() -> list[str]:
+    failures: list[str] = []
+
+    # XLS has LMS4193A and LMS4193B, both routed to Sue Smith.
+    rows = [
+        _row("LMS4193A", manager="Sue Smith"),
+        _row("LMS4193B", manager="Sue Smith"),
+        _row("BCS2707", manager="Jane Doe"),
+    ]
+
+    # Filename gives the base "LMS 4193" — base fallback should route
+    # to Sue (the shared manager) but label the row with the BASE plan.
+    row = match_from_filename_with_base_fallback("LMS 4193 - invoice.pdf", rows)
+    if row is None:
+        failures.append("[base fallback shared manager] returned None")
+    else:
+        if row.manager_name != "Sue Smith":
+            failures.append(
+                f"[base fallback shared manager] expected Sue, got {row.manager_name!r}"
+            )
+        if row.plan_norm != "LMS4193":
+            failures.append(
+                f"[base fallback shared manager] plan_norm should be BASE 'LMS4193', "
+                f"got {row.plan_norm!r}"
+            )
+
+    # XLS has BCS2707A → Sue, BCS2707B → Jane. Filename gives base BCS 2707 →
+    # variants disagree on manager → must refuse to auto-pick.
+    rows_split = [
+        _row("BCS2707A", manager="Sue Smith"),
+        _row("BCS2707B", manager="Jane Doe"),
+    ]
+    row = match_from_filename_with_base_fallback("BCS 2707 - whatever.pdf", rows_split)
+    if row is not None:
+        failures.append(
+            f"[base fallback conflicting managers] expected None, got {row.manager_name!r}"
+        )
+
+    # Exact match wins over fallback.
+    rows_exact = [
+        _row("LMS4193A", manager="Sue Smith"),
+        _row("LMS4193", manager="Jane Doe"),  # exact base also present
+    ]
+    row = match_from_filename_with_base_fallback("LMS 4193 - exact.pdf", rows_exact)
+    if row is None or row.manager_name != "Jane Doe":
+        failures.append(
+            f"[exact wins over fallback] expected Jane, got {row.manager_name if row else None!r}"
+        )
+
+    return failures
+
+
+def test_plan_base() -> list[str]:
+    """Lock in plan_base behaviour: strip a single trailing letter.
+
+    Drives the PDF-vs-subject suffix-variant failsafe in Step 1. The convention
+    aligns with `xls.base_plan_index` (single trailing letter) so two plans
+    count as 'suffix variants of the same base' iff `plan_base(a) == plan_base(b)`.
+    """
+    failures: list[str] = []
+
+    cases = [
+        # Single trailing letter -> stripped
+        ("LMS4193C", "LMS4193"),
+        ("LMS4193T", "LMS4193"),
+        ("EPS4280A", "EPS4280"),
+        ("BCS2707A", "BCS2707"),
+        ("BCS2707B", "BCS2707"),
+        # No trailing letter -> unchanged
+        ("BCS2707", "BCS2707"),
+        ("EPS4280", "EPS4280"),
+        ("LMS4193", "LMS4193"),
+        # No-digit plans -> unchanged (no trailing-digit + trailing-letter pattern)
+        ("GVCCA", "GVCCA"),
+        # Lowercase input -> uppercased
+        ("lms4193c", "LMS4193"),
+        # Empty -> empty
+        ("", ""),
+        # Whitespace-padded input -> stripped + uppercased + base-extracted
+        (" LMS4193T ", "LMS4193"),
+        ("\tBCS2707\n", "BCS2707"),
+        ("  ", ""),
+        # No prefix letters at all -> returned as-is (no match)
+        ("4193T", "4193"),
+        ("4193", "4193"),
+    ]
+    for plan, expected in cases:
+        got = plan_base(plan)
+        if got != expected:
+            failures.append(f"[plan_base({plan!r})] expected {expected!r}, got {got!r}")
+
+    # The point of the helper: detect suffix variants of the same base.
+    suffix_variant_pairs = [
+        ("LMS4193C", "LMS4193T"),  # both have suffix, same base
+        ("EPS4280", "EPS4280A"),   # one bare base, one suffixed — still confusable
+        ("BCS2707A", "BCS2707B"),  # adjacent suffix letters
+    ]
+    for a, b in suffix_variant_pairs:
+        if plan_base(a) != plan_base(b):
+            failures.append(
+                f"[suffix variants {a!r} and {b!r}] expected same base, "
+                f"got {plan_base(a)!r} vs {plan_base(b)!r}"
+            )
+
+    distinct_base_pairs = [
+        ("BCS2707", "BCS2800"),    # different digits
+        ("BCS2707", "EPS2707"),    # different prefix
+        ("LMS4193", "LMS222"),     # different digits, same prefix
+        ("GVCCA", "LMS4193"),      # no-digit vs digit
+    ]
+    for a, b in distinct_base_pairs:
+        if plan_base(a) == plan_base(b):
+            failures.append(
+                f"[distinct bases {a!r} and {b!r}] expected different bases, "
+                f"both came back as {plan_base(a)!r}"
+            )
+
+    return failures
+
+
+def main() -> int:
+    all_failures: list[str] = []
+    for label, fn in [
+        ("subject normalization (a)", test_subject_normalization),
+        ("subject breathing room", test_subject_breathing_room),
+        ("no-digit plan match (b)", test_no_digit_plan_matches_pdf_text),
+        ("filename base fallback (e)", test_filename_base_fallback),
+        ("plan_base (suffix-variant detection)", test_plan_base),
+    ]:
+        fails = fn()
+        status = "OK  " if not fails else "FAIL"
+        print(f"{status}[{label}] ({len(fails)} failure{'s' if len(fails) != 1 else ''})")
+        all_failures.extend(fails)
+
+    if all_failures:
+        print("\nFAILURES:")
+        for f in all_failures:
+            print(f"  - {f}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

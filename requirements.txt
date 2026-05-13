@@ -1,0 +1,13 @@
+msal
+requests
+python-dotenv
+openpyxl
+pypdf
+pdfplumber
+reportlab
+Pillow
+pypdfium2
+pikepdf
+numpy
+portalocker
+tzdata
