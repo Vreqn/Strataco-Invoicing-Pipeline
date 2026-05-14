@@ -11,6 +11,82 @@ Versioning: MAJOR.MINOR.PATCH
 
 
 ---------------------------------------------------------------------------
+0.15.1  —  2026-05-14  —  Conversation-link priors: fix the double-move 404,
+                          recover a stranded source on a failed move
+---------------------------------------------------------------------------
+
+The v0.15.0 production run processed 44 emails cleanly except for one
+error in Step 1's log:
+
+  move-to-processed_emails failed: 404 Client Error: Not Found for url:
+  .../messages/AAMk...44iJSAAA%3D/move
+
+Root cause — a guaranteed double-move. When a conversation-link reply
+pulls a PDF from a prior message in the same thread, Step 1's reply
+branch moves BOTH the reply and that prior out of the Inbox, to the
+correct destination folder (processed_emails or duplicate_emails, per
+_email_destination). But the prior message is still in the inbox list
+the outer loop is iterating. When the loop reached it, the
+consumed_prior_ids skip branch tried to move it a SECOND time — and the
+message was already gone, so Graph 404'd. The redundant move also
+hardcoded processed_emails, so even on the (impossible) success path it
+would have mis-filed a prior that belonged in duplicate_emails.
+
+First fix: the skip branch no longer re-moves. The reply branch is the
+sole owner of moving a consumed prior.
+
+Codex adversarial-review follow-up — the first fix introduced a quieter
+gap. consumed_prior_ids was populated the moment a prior's PDFs were
+committed, BEFORE either Outlook move was attempted. The new skip branch
+treated membership as proof the prior had been filed. If the reply
+branch's source-move actually failed (a transient Graph error, after the
+PDFs and ledger were already committed), the later skip-branch visit
+silently passed over it — the source email sat stranded in the Inbox,
+unmoved and unflagged, while the log misleadingly said "already routed".
+
+Second fix: consumed_prior_ids (a set) became consumed_priors (a dict)
+carrying the source's move DISPOSITION:
+  - value None        — the reply branch filed the source successfully;
+                        the skip branch just logs and continues.
+  - value <folder id> — the reply branch committed the source's PDFs but
+                        its move FAILED; the skip branch retries the move
+                        once to that folder.
+Membership is now recorded AFTER the move attempt, not before. A retry
+that also fails leaves the source in the Inbox with BOTH failures in
+run.errors, so the daily summary shows status=error — never a silent
+skip. (Retry rather than flag: a failed move is almost always transient
+and the email just needs filing, not human review; a red flag would tell
+the front desk to act when there is nothing to act on.)
+
+Behaviour is unchanged on the happy path — both messages still land in
+processed_emails / duplicate_emails exactly as before. No .env keys, no
+new tunables, no path changes.
+
+Regression tests added (tests/test_step1_consumed_prior_move.py — the
+first test to exercise Step 1's main() outer loop end-to-end, Graph and
+prior-processing internals mocked):
+  - test_consumed_prior_is_moved_exactly_once — happy path: the prior is
+    moved exactly once, by the reply branch; the skip branch does not
+    re-move.
+  - test_consumed_prior_move_retried_when_reply_branch_move_failed — the
+    source move fails once; the skip branch retries and succeeds; the
+    original failure is surfaced in run.errors.
+  - test_consumed_prior_left_in_inbox_when_retry_also_fails — the source
+    move fails on every attempt; the skip branch retries exactly once
+    (bounded, no loop), both failures are surfaced, the prior is left in
+    the Inbox rather than silently skipped.
+Full suite: 212 passed.
+
+Files:
+- steps/step_1_intake.py — consumed_prior_ids set -> consumed_priors
+  disposition dict; skip branch reworked; prior recorded after the move.
+- tests/test_step1_consumed_prior_move.py — new.
+- workflows/step_1_intake.md — "Reply and original processed in the same
+  run" bullet updated to document the disposition values and the
+  failed-move retry.
+
+
+---------------------------------------------------------------------------
 0.15.0  —  2026-05-13  —  A PDF with no plan number routes on the subject
 ---------------------------------------------------------------------------
 

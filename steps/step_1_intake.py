@@ -747,10 +747,17 @@ def main() -> int:
             return 1
 
         received_str = _today_received_str()
-        # Track which prior-message IDs we've consumed via the conversation-link
-        # path so we don't try to route the same PDF a second time when Step 1
-        # iterates to the original message in the same run.
-        consumed_prior_ids: set[str] = set()
+        # Prior-message IDs consumed via the conversation-link path. Membership
+        # (regardless of value) means "don't re-route this prior's PDFs" — Step 1
+        # must not route the same PDF again when it iterates to the original
+        # message in the same run. The value carries the source email's move
+        # disposition:
+        #   None        -> the reply branch already moved the source out of the
+        #                  Inbox; the outer-loop skip branch just logs + skips.
+        #   <folder id> -> the reply branch committed the source's PDFs but its
+        #                  Outlook move FAILED; the skip branch retries the move
+        #                  once to that folder.
+        consumed_priors: dict[str, str | None] = {}
         # Track prior-message IDs that the conversation-link path *flagged* (a
         # later reply pointed at this prior, but its PDFs clashed with the
         # reply's plan). The reply already has the red flag; the prior must
@@ -762,16 +769,33 @@ def main() -> int:
 
         for msg in messages:
             msg_id = msg.get("id") or ""
-            if msg_id in consumed_prior_ids:
-                run.info(
-                    f"skip: '{(msg.get('subject') or '')[:60]}' already routed "
-                    f"via conversation-link from a later reply in this run"
-                )
-                if processed_folder_id:
+            if msg_id in consumed_priors:
+                retry_folder_id = consumed_priors[msg_id]
+                subject_preview = (msg.get("subject") or "")[:60]
+                if retry_folder_id is None:
+                    # The reply branch already moved this prior out of the Inbox,
+                    # to its correct destination folder. Re-moving here would be
+                    # a guaranteed double-move (the message is gone, Graph 404s).
+                    run.info(
+                        f"skip: '{subject_preview}' already routed and filed via "
+                        f"conversation-link from a later reply in this run"
+                    )
+                else:
+                    # The reply branch committed this prior's PDFs but its
+                    # Outlook move failed — retry once so the source isn't left
+                    # stranded in the Inbox.
                     try:
-                        graph.move_message_to_folder(msg_id, processed_folder_id)
+                        graph.move_message_to_folder(msg_id, retry_folder_id)
+                        consumed_priors[msg_id] = None
+                        run.info(
+                            f"recovered: moved stranded conversation-link source "
+                            f"'{subject_preview}' to its target folder on retry"
+                        )
                     except Exception as exc:
-                        run.error(f"move-to-processed_emails failed: {exc}")
+                        run.error(
+                            f"retry move of stranded conversation-link source "
+                            f"'{subject_preview}' failed: {exc} — leaving in Inbox"
+                        )
                 continue
             if msg_id in flagged_prior_ids:
                 run.info(
@@ -815,7 +839,7 @@ def main() -> int:
                 # message in the same conversation. Walk through priors newest
                 # first; the first one we successfully route (or duplicate-skip)
                 # from wins.
-                exclude_ids = consumed_prior_ids | {msg_id}
+                exclude_ids = set(consumed_priors) | {msg_id}
                 priors = _find_priors_with_attachments(
                     conv_id, exclude_ids, received_iso, run
                 )
@@ -867,7 +891,7 @@ def main() -> int:
                     # already; we don't want a later outer-loop iteration to
                     # move the source into `processed_emails` and hide the
                     # failure. Treat it like a clash: flag the reply and stop
-                    # walking, but do NOT add to `consumed_prior_ids`.
+                    # walking, but do NOT record it in `consumed_priors`.
                     any_committed = any(
                         o in (RouteOutcome.ROUTED, RouteOutcome.DUPLICATE_SKIPPED)
                         for o in result.outcomes
@@ -889,7 +913,9 @@ def main() -> int:
                         flagged_via_prior = True
                         break
                     if any_committed:
-                        consumed_prior_ids.add(prior_id)
+                        # Record in `consumed_priors` *after* the move attempt
+                        # below — its disposition value depends on whether the
+                        # source move succeeds.
                         used_prior_id = prior_id
                         used_prior_outcomes = result.outcomes
                         break
@@ -913,6 +939,11 @@ def main() -> int:
                 target_folder_id = _email_destination(
                     used_prior_outcomes, processed_folder_id, duplicate_folder_id
                 )
+                # `used_prior_outcomes` holds only ROUTED / DUPLICATE_SKIPPED
+                # here (the any_failed case broke out earlier), so
+                # `_email_destination` never returns None on this path — the
+                # guard below stays for defensiveness.
+                source_retry_folder_id: str | None = None
                 if target_folder_id is not None:
                     for target_msg_id, label in (
                         (msg_id, "reply"),
@@ -925,6 +956,12 @@ def main() -> int:
                                 f"move {label} msg {target_msg_id[:12]}... to "
                                 f"target folder failed: {exc}"
                             )
+                            if label == "source":
+                                source_retry_folder_id = target_folder_id
+                # Mark the prior consumed so the outer loop doesn't re-route its
+                # PDFs. None -> source filed OK (skip it); a folder id -> source
+                # move failed, the skip branch retries the move there.
+                consumed_priors[used_prior_id] = source_retry_folder_id
 
             elif not plan_row and has_atts:
                 _process_pdf_text_fallback(
