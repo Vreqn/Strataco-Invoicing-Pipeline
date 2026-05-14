@@ -21,6 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools._lib.plan_match import (
+    find_explicit_plan_tokens,
     match_from_filename_with_base_fallback,
     match_from_pdf_text,
     pick_from_subject,
@@ -186,6 +187,47 @@ def test_filename_base_fallback() -> None:
     assert row is not None and row.manager_name == "Jane Doe", (
         f"[exact wins over fallback] expected Jane, got {row.manager_name if row else None!r}"
     )
+
+
+def test_find_explicit_plan_tokens() -> None:
+    """`find_explicit_plan_tokens` fires only when the text literally labels a
+    token a strata plan — it must NOT depend on the managed plan list, and it
+    must NOT guess at bare PO / account / invoice numbers.
+
+    Drives Step 1's NO_PLAN vs AMBIGUOUS split: a PDF that explicitly names a
+    plan we don't manage (e.g. "Strata Plan KAS 9999") gets flagged for review;
+    an ordinary invoice with no "Strata Plan" wording routes on the subject.
+    """
+    # Explicitly-labelled plans are detected regardless of managed prefixes.
+    assert find_explicit_plan_tokens("Strata Plan KAS 9999") == ["KAS9999"], (
+        "[explicit KAS] expected ['KAS9999']"
+    )
+    assert find_explicit_plan_tokens("STRATA PLAN BCS 2707A — invoice") == ["BCS2707A"], (
+        "[explicit BCS2707A] expected ['BCS2707A']"
+    )
+    assert find_explicit_plan_tokens("re: strata plan no. EPS6008 attached") == ["EPS6008"], (
+        "[explicit with 'no.'] expected ['EPS6008']"
+    )
+    assert find_explicit_plan_tokens("Strata LMS-4193 statement") == ["LMS4193"], (
+        "[explicit 'Strata <token>'] expected ['LMS4193']"
+    )
+
+    # De-duplicated, first-seen order.
+    assert find_explicit_plan_tokens(
+        "Strata Plan KAS 9999 ... see Strata Plan BCS 2707 ... Strata Plan KAS 9999 again"
+    ) == ["KAS9999", "BCS2707"], "[dedup/order] expected ['KAS9999', 'BCS2707']"
+
+    # No "Strata Plan" wording → nothing. Ordinary invoice tokens must NOT match,
+    # or the reply-to-self recovery loop comes back.
+    for negative in [
+        "Invoice #4567, PO 12345, account AB1029. Total $500.00.",
+        "BCS 2707 invoice attached",          # plan-shaped, but not labelled "Strata Plan"
+        "Reference KAS9999 for your records",  # bare token, no label
+        "",
+    ]:
+        assert find_explicit_plan_tokens(negative) == [], (
+            f"[negative {negative!r}] expected [], got {find_explicit_plan_tokens(negative)}"
+        )
 
 
 def test_plan_base() -> None:

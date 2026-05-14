@@ -16,6 +16,85 @@ entry — ignore them unless a developer asks.
 
 
 --------------------------------------------------------------------------
+2026-05-13  —  PDF references an unmanaged strata plan: what happens to it?
+--------------------------------------------------------------------------
+
+Question: When a PDF's text explicitly labels a strata plan ("Strata Plan
+KAS 9999") that is NOT in Strataplan_List.xlsx, the email is flagged and
+held in the Inbox — but there is no defined process for that invoice.
+What should happen to it?
+
+Background: 0.15.0 made Step 1 trust the subject's plan when a PDF carries
+no plan number at all (the "NO_PLAN" case — see ReleaseNotes.txt). But it
+deliberately does NOT do that when the PDF explicitly names a plan that
+simply isn't one we manage (the "AMBIGUOUS / Case 3" path). That email
+keeps its Outlook red flag and stays in the Inbox. The problem: even if
+the front desk replies-to-self with that plan in the subject, the invoice
+still can't move — the plan has no manager and no accounts-payable person
+in Strataplan_List.xlsx, so Steps 3-6 have nowhere to route or file it.
+It would just error further down the line.
+
+Detection note: there is no strict formula for what a strata plan number
+looks like, so the system does NOT guess. It only treats a token as a
+plan reference when the document literally writes "Strata Plan ..." next
+to it. A bare "KAS 9999", or a PO / account / invoice number, is NOT
+flagged — it routes on the subject like any ordinary plan-less invoice.
+That means the rare unmanaged invoice that names its plan WITHOUT the
+words "Strata Plan" will slip through to the subject's manager. Per
+Krisztian that is acceptable: these are once-or-twice cases.
+
+Example: An invoice PDF reads "Strata Plan KAS 9999." KAS 9999 isn't on
+our plan list — maybe it's a plan another firm manages, a plan that was
+closed, or the vendor mistyped it. The subject of the email says a valid
+plan we DO manage. Today the email is flagged and sits in the Inbox with
+no further path.
+
+  Option A — Front desk asks the vendor to confirm the correct plan.
+             If the vendor really meant one of our plans, they resend
+             with the right number and it routes normally. If the plan
+             genuinely isn't ours, the invoice was misdirected and the
+             front desk tells the vendor so. No code change.
+
+  Option B — Add the plan to Strataplan_List.xlsx if it's genuinely one
+             we now manage. Once it has a manager + AP, the existing
+             pipeline handles it with no special-casing.
+
+  Option C — Define a manual handling path for "real invoice, plan not
+             on our list" — e.g. a dedicated folder or a developer
+             escalation — for the case where the invoice IS ours to pay
+             but the plan list hasn't caught up.
+
+Considered and rejected: an "outdated" folder wired to a placeholder
+manager/AP. Krisztian's view — it would catch too much (you can't tell a
+genuine outdated plan from noise) and nobody will keep a separate
+"outdated plans" sheet current. Also rejected: a hardcoded list of all BC
+strata prefixes — same maintenance problem.
+
+How this affects the front desk: under Option A the recipe is "confirm
+the plan with the vendor." Options B and C are developer/admin actions.
+
+Interim behaviour (Krisztian, 2026-05-14): keep the email flagged in the
+Inbox until the client answers. Most likely outcome is these get
+processed manually — they're rare enough that a defined automated path
+may not be worth building.
+
+Decision:
+
+
+  Technical references:
+  - steps/step_1_intake.py::_classify_pdf_against_subject — Pass 3.
+    NO_PLAN requires BOTH `result.detected` empty AND
+    `plan_match.find_explicit_plan_tokens(text)` empty; otherwise
+    AMBIGUOUS. This Case 3 is the "explicit token, not in list" branch.
+  - tools/_lib/plan_match.py::find_explicit_plan_tokens — the
+    managed-list-independent "Strata Plan ..." scanner.
+  - steps/step_1_intake.py::_decide_email_action — "any AMBIGUOUS -> FLAG"
+    branch.
+  - workflows/step_1_intake.md — outcome table + "PDF references an
+    unmanaged strata plan" edge case.
+
+
+--------------------------------------------------------------------------
 2026-05-13  —  Multi-PDF email with suffix-variant plans: route or hold?
 --------------------------------------------------------------------------
 

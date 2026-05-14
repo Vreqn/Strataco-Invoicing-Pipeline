@@ -167,6 +167,89 @@ def test_pdf_text_wins_over_conflicting_filename() -> None:
     )
 
 
+def test_pdf_text_with_no_plan_token_is_no_plan() -> None:
+    """PDF has extractable text but it carries no strata plan number at all.
+    The matcher detects zero plan-shaped tokens -> NO_PLAN, which the decision
+    matrix treats like EMPTY (route on the subject). Flagging this would loop
+    the front desk's reply-to-self recovery forever.
+    """
+    rows = [_row("EPS6008")]
+
+    with patch.object(
+        s1, "extract_full_text",
+        return_value="Invoice for services rendered. Total $500.00. Thank you.",
+    ):
+        cls = _classify_pdf_against_subject(
+            blob=b"%PDF-1.4 stub bytes",
+            base_name="invoice.pdf",
+            subject_plan_norm="EPS6008",
+            rows=rows,
+        )
+
+    assert cls.outcome == PdfOutcome.NO_PLAN, (
+        f"[no plan token -> NO_PLAN] expected NO_PLAN, got {cls.outcome.value} "
+        f"(note={cls.note!r})"
+    )
+
+
+def test_pdf_text_with_unmanaged_plan_token_stays_ambiguous() -> None:
+    """PDF text contains a plan-shaped token (EPS 9999) whose prefix IS managed
+    but whose number is not. `match_from_pdf_text` detects it (EPS is an active
+    prefix), so `result.detected` is non-empty -> AMBIGUOUS, and the email stays
+    flagged for human review (Case 3 — see To-Speak-About.txt).
+    """
+    rows = [_row("EPS6008")]
+
+    with patch.object(
+        s1, "extract_full_text",
+        return_value="Strata Plan EPS 9999 invoice #12345",
+    ):
+        cls = _classify_pdf_against_subject(
+            blob=b"%PDF-1.4 stub bytes",
+            base_name="invoice.pdf",
+            subject_plan_norm="EPS6008",
+            rows=rows,
+        )
+
+    assert cls.outcome == PdfOutcome.AMBIGUOUS, (
+        f"[unmanaged plan token -> AMBIGUOUS] expected AMBIGUOUS, got "
+        f"{cls.outcome.value} (note={cls.note!r}, detected={cls.detected!r})"
+    )
+
+
+def test_pdf_text_names_unmanaged_plan_stays_ambiguous() -> None:
+    """[Codex finding] PDF text explicitly names a plan whose PREFIX is not in
+    the managed list at all ("Strata Plan KAS 9999" with only EPS/BCS rows).
+
+    `match_from_pdf_text` builds its detection regex only from managed prefixes,
+    so KAS is invisible to it and `result.detected` comes back empty. The pre-
+    fix code keyed NO_PLAN purely off `not result.detected` and would have
+    auto-routed this PDF to the subject's manager. `find_explicit_plan_tokens`
+    catches the "Strata Plan ..." wording independently of the managed list, so
+    the classifier now returns AMBIGUOUS and the email is flagged for review.
+    """
+    rows = [_row("EPS6008"), _row("BCS3396")]
+
+    with patch.object(
+        s1, "extract_full_text",
+        return_value="Please remit for Strata Plan KAS 9999 invoice #12345",
+    ):
+        cls = _classify_pdf_against_subject(
+            blob=b"%PDF-1.4 stub bytes",
+            base_name="invoice.pdf",
+            subject_plan_norm="EPS6008",
+            rows=rows,
+        )
+
+    assert cls.outcome == PdfOutcome.AMBIGUOUS, (
+        f"[unmanaged-prefix plan -> AMBIGUOUS] expected AMBIGUOUS (must not be "
+        f"NO_PLAN), got {cls.outcome.value} (note={cls.note!r})"
+    )
+    assert "KAS9999" in cls.note, (
+        f"[unmanaged-prefix plan] note should name the unmanaged plan, got {cls.note!r}"
+    )
+
+
 def test_is_real_pdf_magic_byte_check() -> None:
     """[0.11.3 / Codex finding 1] `_is_real_pdf` accepts only bytes that start
     with the PDF magic header `%PDF-`. Rejects PNG, ZIP, empty, short garbage.

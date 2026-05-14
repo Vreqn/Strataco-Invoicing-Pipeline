@@ -25,7 +25,7 @@ Step 1 only downloads and processes **PDF and ZIP** attachments. Other attachmen
 
 ZIP attachments are inspected in memory via `tools/_lib/zip_safe.py::audit_and_extract_pdfs`. Each contained PDF is downloaded into RAM, classified the same way a top-level PDF is, and becomes a full participant in `_decide_email_action` / the all-or-nothing rule. ZIPs themselves are **never written to disk by Step 1** — their useful payload (the PDFs inside) is routed directly to manager folders. Routed names use the convention `<zipbase>__<inner>.pdf` so the audit trail shows where the file came from.
 
-The audit is strict: a ZIP that contains any non-PDF entries (`.docx`, `.txt`, etc.), is encrypted, exceeds the bomb-protection caps (`ZIP_MAX_*` in `.env`), or has corrupt bytes raises `UnsafeZipError`. Step 1 then keeps the parent email in the Inbox with the Outlook red flag and writes nothing to disk — the strictest interpretation of "Inbox is the single source of truth," and the resolution of the 2026-05-13 ZIP-orphan entry in `To-Speak-About.txt`. macOS resource-fork files (`__MACOSX/`, `._foo.pdf`) are silently ignored so Mac-authored ZIPs don't trip the strict check.
+The audit is strict: a ZIP that contains any non-PDF entries (`.docx`, `.xlsx`, etc.), is encrypted, exceeds the bomb-protection caps (`ZIP_MAX_*` in `.env`), or has corrupt bytes raises `UnsafeZipError`. Step 1 then keeps the parent email in the Inbox with the Outlook red flag and writes nothing to disk — the strictest interpretation of "Inbox is the single source of truth," and the resolution of the 2026-05-13 ZIP-orphan entry in `To-Speak-About.txt`. Two kinds of entry are silently ignored rather than tripping the strict check: macOS resource-fork files (`__MACOSX/`, `._foo.pdf`) so Mac-authored ZIPs pass, and `.txt` companion files (`IGNORABLE_COMPANION_EXTS` in `zip_safe.py`) since a `.txt` is never an invoice — e.g. TELUS Bill Analyzer staples a `manifest.txt` next to the invoice PDF, and the PDF still routes (0.14.2).
 
 If a real invoice arrives as a `.docx` or `.xlsx`, the operator asks the vendor to resend as PDF (per client policy as of 0.11.2).
 
@@ -51,22 +51,23 @@ Evidence priority inside `_classify_pdf_against_subject` (as of 0.11.3 — order
 
 If PDF text confidently identifies plan X and the filename says plan Y, **PDF text wins** — outcome is the body's plan, not the filename's. This catches the "vendor renamed invoice to match the wrong subject" case.
 
-Each PDF gets classified into one of four outcomes (`PdfOutcome` in `steps/step_1_intake.py`):
+Each PDF gets classified into one of five outcomes (`PdfOutcome` in `steps/step_1_intake.py`):
 
 | Outcome | Condition |
 |---|---|
 | **AGREE** | PDF text confidently identifies the same plan as the subject. |
 | **EMPTY** | PDF has no extractable text (scanned image / no text layer). No evidence either way. |
-| **AMBIGUOUS** | PDF mentions plan tokens but the matcher can't pick one safely (e.g. two equally-scored candidates). |
-| **CLASH** | PDF confidently identifies a *different* plan than the subject. |
+| **NO_PLAN** | PDF has extractable text but carries **no strata plan number at all** — neither a managed-plan token (`match_from_pdf_text`) **nor** a token the document explicitly labels "Strata Plan …" (`plan_match.find_explicit_plan_tokens`). No evidence either way; treated exactly like EMPTY. Flagging this would loop the reply-to-self recovery (0.15.0). |
+| **AMBIGUOUS** | PDF text names a plan but it didn't resolve — a managed-prefix token the matcher couldn't pick, two equally-scored managed candidates, **or** a plan the PDF explicitly labels "Strata Plan …" whose prefix/number isn't in `Strataplan_List.xlsx` (e.g. "Strata Plan KAS 9999"). The explicit-wording scan is what catches unmanaged-*prefix* plans — `match_from_pdf_text`'s detector only sees managed prefixes. |
+| **CLASH** | PDF confidently identifies a *different* managed plan than the subject. |
 
 The per-PDF classifications are combined into a single email-level action by `_decide_email_action`:
 
 | Case | Action |
 |---|---|
-| Every PDF is AGREE or EMPTY | **ROUTE_AS_SUBJECT** — current behaviour, stamp using subject's plan. |
+| Every PDF is AGREE, EMPTY, or NO_PLAN | **ROUTE_AS_SUBJECT** — stamp using subject's plan. EMPTY and NO_PLAN carry no evidence against the subject, so the subject is trusted. |
 | Any PDF is AMBIGUOUS | **FLAG** — strict-first, don't trust ambiguous evidence. |
-| Mix of EMPTY and CLASH | **FLAG** — can't safely route the empty PDF when its sibling disagrees. |
+| Mix of EMPTY/NO_PLAN and CLASH | **FLAG** — can't safely route a no-plan PDF when its sibling disagrees with the subject. |
 | All PDFs CLASH on the same plan (≠ subject) | **FLAG** — consensus clash, vendor likely mislabelled the subject. |
 | Multiple PDFs, plan bases collide (e.g. `LMS4193C` + `LMS4193T`, `EPS4280` + `EPS4280A`) | **FLAG** — suffix-variant failsafe, easy to confuse. |
 | Multiple PDFs, distinct plan bases (e.g. `BCS2707` + `BCS2800`) | **AUTO_SPLIT** — each PDF routes to its own plan, subject ignored. |
@@ -93,7 +94,7 @@ When the subject and body don't yield a plan, Step 1 still tries to match each P
 - **Every PDF (top-level or ZIP-contained) text- or filename-matched a plan, every ZIP passed the safety audit** → route the PDFs, move the email to `processed_emails`. ZIPs themselves are not written to disk; their contained PDFs have already been routed.
 - **Anything less** (any unmatched PDF, invalid PDF bytes, unsafe ZIP, download failure) → leave the entire email in the Inbox **with the Outlook red flag**. **Nothing is written to disk.** Even the would-have-matched PDFs are not committed.
 
-Discarded non-PDF/non-ZIP attachments (signature PNGs, `.docx` attached at the top level, `.xlsx`) don't exist past Pass 1, so they don't gate the decision. ZIP-contained `.docx`/`.txt` etc. DO gate the decision — the strict `zip_safe` audit treats them as unsafe.
+Discarded non-PDF/non-ZIP attachments (signature PNGs, `.docx` attached at the top level, `.xlsx`) don't exist past Pass 1, so they don't gate the decision. ZIP-contained `.docx`/`.xlsx` etc. DO gate the decision — the strict `zip_safe` audit treats them as unsafe. ZIP-contained `.txt` files do NOT gate — they're skipped like macOS resource-fork noise (0.14.2).
 
 Why all-or-nothing rather than save unmatched stuff to `_Unmatched/`? Because operators don't routinely check `_Unmatched/Invoices/` — their workflow looks at the Inbox. Saving something to `_Unmatched/` is effectively hiding it. Keeping the email in the Inbox preserves the "Inbox is the single source of truth" principle. The 2026-05-13 ZIP-orphan fix removed the last remaining ZIP exemption from this rule.
 
@@ -145,10 +146,12 @@ For the rare partial-commit flag, the front desk escalates to the developer rath
 - **Scanned (image-only) PDFs**: `extract_full_text` returns empty and `match_from_pdf_text` reports `"No text extracted (scanned PDF?)."`. Behaviour depends on the branch:
   - *Subject/body matched* → classified as `EMPTY`; routes on the subject's plan (no clash evidence on either side).
   - *No subject/body match* → treated as unmatched; the email stays in Inbox for operator recovery via reply-to-self.
+- **PDF with text but no plan number at all**: `extract_full_text` returns text, but neither `match_from_pdf_text` (`result.detected` empty) nor `plan_match.find_explicit_plan_tokens` (no "Strata Plan …" wording) finds anything. When the *subject/body matched*, this is classified as `NO_PLAN` and routes on the subject's plan — same stance as `EMPTY`. Before 0.15.0 this was lumped into `AMBIGUOUS` and flagged, which deadlocked the reply-to-self recovery: the corrected reply went through the conversation-link path, re-ran the same cross-check against the same plan-less PDF, and re-flagged it forever. `NO_PLAN` breaks that loop.
+- **PDF references an unmanaged strata plan**: the PDF text contains a plan it isn't in `Strataplan_List.xlsx` (a closed plan, a plan another firm manages, or a vendor typo). Two detection paths: (1) the plan's *prefix* IS managed but the number isn't — `match_from_pdf_text` detects it, `result.detected` is non-empty → `AMBIGUOUS`; (2) the plan's prefix is **not** managed at all (e.g. "KAS" when no KAS plans exist) — `match_from_pdf_text` can't see it, but `find_explicit_plan_tokens` catches the literal "Strata Plan KAS 9999" wording → `AMBIGUOUS`. Either way the email is **flagged and held** in the Inbox. This is deliberate: such an invoice has no manager/AP mapping, so even a corrected reply-to-self can't route it through Steps 3–6. The detector only fires on the explicit "Strata Plan …" phrasing — a bare unlabelled token (or a PO/account number) is **not** treated as a plan, to avoid re-flagging ordinary invoices. What to do with these invoices is a policy question — see the `To-Speak-About.txt` entry "PDF references an unmanaged strata plan" (2026-05-13).
 - **Matched reply with no eligible prior in conversation**: logged as "no eligible prior message in conversation" or "none of the N prior message(s) had a routable PDF". Email stays in Inbox.
 - **Conversation walks priors newest-first**: if the most recent attachment-bearing prior in the conversation has only non-PDF attachments (e.g. a Word doc), it's skipped and the walk continues to older messages. The first prior with a routable PDF wins.
 - **Multiple corrected replies for the same conversation**: handled. Each consumed prior message ID is recorded in-run; subsequent replies in the same run exclude it from their search so the same original PDF isn't routed twice.
-- **Prior message has multiple PDFs**: each prior PDF is cross-validated against the reply's plan using the same `_decide_email_action` matrix as `_process_self_attachments`. AGREE/EMPTY → route on reply's plan. Distinct-base CLASHes → auto-split per PDF. Suffix-variant collisions, consensus clash, ambiguity, or any partial commit → flag the reply (and quarantine the prior, see below).
+- **Prior message has multiple PDFs**: each prior PDF is cross-validated against the reply's plan using the same `_decide_email_action` matrix as `_process_self_attachments`. AGREE/EMPTY/NO_PLAN → route on reply's plan. Distinct-base CLASHes → auto-split per PDF. Suffix-variant collisions, consensus clash, ambiguity, or any partial commit → flag the reply (and quarantine the prior, see below). The NO_PLAN handling is what makes the reply-to-self recovery actually terminate for a PDF that carries no plan number — see the "PDF with text but no plan number at all" edge case above.
 - **Reply and original processed in the same run**: two cases.
   - *Happy path (all priors clean)* → the prior is added to `consumed_prior_ids` on the first successful PDF route, so a later loop iteration over the same original skips it and moves both to `processed_emails`.
   - *Clash or partial-commit path* → the prior is added to `flagged_prior_ids` instead, so a later loop iteration over the same original *skips processing* AND *does not move* it. Both the reply and the original stay in the Inbox; the reply has the red flag.

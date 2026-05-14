@@ -98,6 +98,61 @@ def test_agree_and_empty_routes_as_subject() -> None:
     )
 
 
+def test_no_plan_routes_as_subject() -> None:
+    """A PDF with extractable text but no strata plan number at all carries no
+    evidence against the subject — route on the subject's plan (same stance as
+    EMPTY). Flagging it would loop the front desk's reply-to-self recovery.
+    """
+    a = _decide_email_action(
+        "BCS2707",
+        [_cls(PdfOutcome.NO_PLAN, base_name="plainvoice.pdf")],
+    )
+    assert a.kind == EmailActionKind.ROUTE_AS_SUBJECT, (
+        f"[single NO_PLAN] expected ROUTE_AS_SUBJECT, got {a.kind}"
+    )
+
+    a = _decide_email_action(
+        "BCS2707",
+        [
+            _cls(PdfOutcome.AGREE, plan="BCS2707", base_name="clear.pdf"),
+            _cls(PdfOutcome.NO_PLAN, base_name="plainvoice.pdf"),
+        ],
+    )
+    assert a.kind == EmailActionKind.ROUTE_AS_SUBJECT, (
+        f"[AGREE + NO_PLAN] expected ROUTE_AS_SUBJECT, got {a.kind}"
+    )
+
+    a = _decide_email_action(
+        "BCS2707",
+        [
+            _cls(PdfOutcome.EMPTY, base_name="scanned.pdf"),
+            _cls(PdfOutcome.NO_PLAN, base_name="plainvoice.pdf"),
+        ],
+    )
+    assert a.kind == EmailActionKind.ROUTE_AS_SUBJECT, (
+        f"[EMPTY + NO_PLAN] expected ROUTE_AS_SUBJECT, got {a.kind}"
+    )
+
+
+def test_no_plan_plus_clash_flags() -> None:
+    """A NO_PLAN PDF can't be safely routed when a sibling PDF clashes with the
+    subject — same failsafe as EMPTY + CLASH.
+    """
+    a = _decide_email_action(
+        "BCS2707",
+        [
+            _cls(PdfOutcome.CLASH, plan="BCS2800", base_name="clear.pdf"),
+            _cls(PdfOutcome.NO_PLAN, base_name="plainvoice.pdf"),
+        ],
+    )
+    assert a.kind == EmailActionKind.FLAG_AND_HOLD, (
+        f"[NO_PLAN + CLASH] expected FLAG_AND_HOLD, got {a.kind}"
+    )
+    assert "plainvoice.pdf" in a.reason, (
+        f"[NO_PLAN + CLASH] reason should name the no-plan PDF, got {a.reason!r}"
+    )
+
+
 def test_single_clash_flags() -> None:
     a = _decide_email_action(
         "BCS2707",
@@ -147,7 +202,7 @@ def test_empty_plus_clash_flags() -> None:
     assert a.kind == EmailActionKind.FLAG_AND_HOLD, (
         f"[CLASH + EMPTY] expected FLAG_AND_HOLD, got {a.kind}"
     )
-    assert "empty" in a.reason.lower(), (
+    assert "scanned.pdf" in a.reason and "mixed evidence" in a.reason.lower(), (
         f"[CLASH + EMPTY] reason should mention the empty PDF, got {a.reason!r}"
     )
 

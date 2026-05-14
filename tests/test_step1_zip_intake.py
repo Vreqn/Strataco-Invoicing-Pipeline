@@ -321,6 +321,47 @@ def test_subject_matched_zip_with_docx_flags_email(monkeypatch, tmp_path: Path) 
     )
 
 
+def test_subject_matched_zip_with_txt_companion_routes_pdfs(monkeypatch, tmp_path: Path) -> None:
+    """A `.txt` companion file inside the ZIP must NOT poison it. Real-world
+    case: TELUS Bill Analyzer emails carry a ZIP with the invoice PDF plus a
+    `manifest.txt`. The `.txt` is skipped, the PDF routes to the manager's
+    To_Approve folder, the email moves to processed_emails, nothing is
+    flagged. Regression for the 7-error 0.14.1 run on 2026-05-13."""
+    pdf_a = _pdf_with_marker("zip-with-txt-pdf")
+    zip_bytes = _build_zip([
+        ("inv_001.pdf", pdf_a),
+        ("manifest.txt", b"plan summary text, not an invoice"),
+    ])
+    attachments = [_zip_att("TELUS Bill Analyzer.zip", att_id="zip-1")]
+    blob_by_id = {"zip-1": zip_bytes}
+    text_by_blob = {pdf_a: "BCS 2707 invoice content"}
+
+    run, m_flag, m_move = _run_self(
+        monkeypatch, tmp_path,
+        attachments=attachments, blob_by_id=blob_by_id,
+        text_by_blob=text_by_blob, plan_norm="BCS2707",
+    )
+
+    m_flag.assert_not_called(), (
+        f"[ZIP-with-txt] expected NO flag; got {m_flag.call_args_list}"
+    )
+    m_move.assert_called_once_with(_MSG_ID, _PROCESSED_FOLDER), (
+        f"[ZIP-with-txt] expected move to processed; got {m_move.call_args_list}"
+    )
+    mgr = _manager_folder(tmp_path, "Sue Smith")
+    routed = sorted(p.name for p in mgr.iterdir()) if mgr.exists() else []
+    assert len(routed) == 1, (
+        f"[ZIP-with-txt] expected 1 routed PDF under {mgr}; got {routed}"
+    )
+    assert "TELUS Bill Analyzer__inv_001" in routed[0], (
+        f"[ZIP-with-txt] expected zipbase__inner prefix in routed name; got {routed}"
+    )
+    unmatched = _unmatched_dir(tmp_path)
+    assert not unmatched.exists() or not list(unmatched.iterdir()), (
+        f"[ZIP-with-txt] expected _Unmatched empty; got {list(unmatched.iterdir())}"
+    )
+
+
 def test_subject_matched_bomb_zip_flags_email(monkeypatch, tmp_path: Path) -> None:
     """Scenario 6: bomb/oversized ZIP — UnsafeZipError surfaces, email flags,
     nothing on disk. Lower ZIP_MAX_ENTRIES via env so we don't need a real

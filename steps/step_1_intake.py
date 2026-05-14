@@ -73,12 +73,20 @@ class PdfOutcome(enum.Enum):
     - AGREE: PDF text confidently identifies the same plan as the subject.
     - EMPTY: PDF has no extractable text (scanned image / no text layer).
       No evidence to contradict the subject; route on subject.
+    - NO_PLAN: PDF has extractable text but contains no recognizable strata
+      plan number at all (no plan-shaped token the matcher could detect). No
+      evidence to contradict the subject; route on subject — same stance as
+      EMPTY. This is the "vendor invoice that just never prints the plan
+      number" case; flagging it would loop the front desk's reply-to-self
+      recovery forever.
     - AMBIGUOUS: PDF text contains plan tokens but the matcher couldn't pick
-      one safely (e.g. two equally-scored candidates). Don't trust either side.
+      one safely — either an unmanaged plan number, or two equally-scored
+      managed candidates. Don't trust either side; flag for review.
     - CLASH: PDF confidently identifies a *different* plan than the subject.
     """
     AGREE = "agree"
     EMPTY = "empty"
+    NO_PLAN = "no_plan"
     AMBIGUOUS = "ambiguous"
     CLASH = "clash"
 
@@ -513,24 +521,45 @@ def _classify_pdf_against_subject(
             detected=[(base_name, 1)],
         )
 
-    # Pass 3: Neither PDF text nor filename gave a confident match. Distinguish
-    # EMPTY (scanned/no text layer) from AMBIGUOUS (text exists but matcher
-    # refused to pick) — operators want different logs for these.
+    # Pass 3: Neither PDF text nor filename gave a confident match. Three
+    # sub-cases, distinguished so the email-level decision and the operator
+    # logs can treat them differently:
+    #   - EMPTY: no text layer at all (scanned image).
+    #   - NO_PLAN: text exists but carries no strata plan number — neither a
+    #     managed-plan token (`result.detected`) NOR a token the document
+    #     explicitly labels "Strata Plan ..." (`find_explicit_plan_tokens`).
+    #     No evidence to contradict the subject, so route on subject (same
+    #     stance as EMPTY). Flagging this would loop the reply-to-self recovery.
+    #   - AMBIGUOUS: text names a plan but it didn't resolve — a managed-prefix
+    #     token the matcher couldn't pick, a genuine tie between two managed
+    #     plans, OR a plan the PDF explicitly names that isn't in the managed
+    #     list (e.g. "Strata Plan KAS 9999"). Strict-first: flag for review.
+    #     `result.detected` only covers managed prefixes, so the explicit-
+    #     wording scan is what catches unmanaged plans.
+    explicit_tokens = plan_match.find_explicit_plan_tokens(text)
     note_low = (result.note or "").lower()
     if note_low.startswith("no text extracted"):
         outcome = PdfOutcome.EMPTY
+        note = result.note
+    elif not result.detected and not explicit_tokens:
+        outcome = PdfOutcome.NO_PLAN
+        note = "No strata plan number found in PDF text; routing on subject."
     else:
-        # "Ambiguous: ..." or "Detected plan text, but no match in list..." —
-        # both are unsafe-to-auto-pick. Strict-first: treat as AMBIGUOUS so
-        # the email-level decision flags it for review when combined with a CLASH.
         outcome = PdfOutcome.AMBIGUOUS
+        if not result.detected:
+            note = (
+                f"PDF names strata plan(s) not in the managed list: "
+                f"{', '.join(explicit_tokens)}; flagged for review."
+            )
+        else:
+            note = result.note
     return PdfClassification(
         outcome=outcome,
         base_name=base_name,
         blob=blob,
         pdf_plan_norm="",
         pdf_plan_row=None,
-        note=result.note,
+        note=note,
         detected=result.detected,
     )
 
@@ -543,9 +572,9 @@ def _decide_email_action(
 
     Decision matrix (see workflows/step_1_intake.md):
 
-      - all AGREE/EMPTY                       → ROUTE_AS_SUBJECT
+      - all AGREE/EMPTY/NO_PLAN               → ROUTE_AS_SUBJECT
       - any AMBIGUOUS                         → FLAG (strict-first)
-      - any EMPTY mixed with any CLASH        → FLAG (can't safely route the empty one)
+      - any EMPTY/NO_PLAN mixed with any CLASH → FLAG (can't safely route it)
       - all PDFs confident, ≥1 CLASH:
         - all PDF plans equal (consensus)     → FLAG (subject vs unanimous PDFs)
         - multiple unique plans, shared base  → FLAG (suffix-variant failsafe)
@@ -553,8 +582,10 @@ def _decide_email_action(
 
     Notes:
       * "Confident" here means the PDF returned an active plan with a manager
-        (PdfOutcome.AGREE or PdfOutcome.CLASH). EMPTY and AMBIGUOUS are not
-        confident.
+        (PdfOutcome.AGREE or PdfOutcome.CLASH). EMPTY, NO_PLAN, and AMBIGUOUS
+        are not confident.
+      * EMPTY and NO_PLAN are treated identically: neither carries evidence
+        that contradicts the subject, so the subject's plan is trusted.
       * The base-collision check covers the subject's plan implicitly: if a
         PDF's plan AGREES, its plan_norm equals subject_plan_norm, and that
         plan appears in `unique_plans`, so the base check catches a "subject
@@ -568,12 +599,17 @@ def _decide_email_action(
 
     outcomes = [c.outcome for c in classifications]
 
-    if all(o in (PdfOutcome.AGREE, PdfOutcome.EMPTY) for o in outcomes):
+    if all(
+        o in (PdfOutcome.AGREE, PdfOutcome.EMPTY, PdfOutcome.NO_PLAN)
+        for o in outcomes
+    ):
         agreed = sum(1 for o in outcomes if o == PdfOutcome.AGREE)
         empty = sum(1 for o in outcomes if o == PdfOutcome.EMPTY)
+        no_plan = sum(1 for o in outcomes if o == PdfOutcome.NO_PLAN)
         return EmailAction(
             EmailActionKind.ROUTE_AS_SUBJECT,
-            f"PDF cross-check OK ({agreed} agree, {empty} empty)",
+            f"PDF cross-check OK ({agreed} agree, {empty} empty, "
+            f"{no_plan} no plan # in PDF — routed under subject)",
         )
 
     if any(o == PdfOutcome.AMBIGUOUS for o in outcomes):
@@ -583,17 +619,22 @@ def _decide_email_action(
             f"ambiguous PDF text: {', '.join(amb_names)}",
         )
 
-    # At this point: every PDF is AGREE / EMPTY / CLASH, and at least one CLASH.
-    if any(o == PdfOutcome.EMPTY for o in outcomes):
-        empty_names = [c.base_name for c in classifications if c.outcome == PdfOutcome.EMPTY]
+    # At this point: every PDF is AGREE / EMPTY / NO_PLAN / CLASH, and at least
+    # one CLASH. An EMPTY or NO_PLAN PDF carries no plan of its own, so it can't
+    # be safely routed when a sibling PDF clashes with the subject.
+    if any(o in (PdfOutcome.EMPTY, PdfOutcome.NO_PLAN) for o in outcomes):
+        no_evidence_names = [
+            c.base_name for c in classifications
+            if c.outcome in (PdfOutcome.EMPTY, PdfOutcome.NO_PLAN)
+        ]
         clash_summary = [
             f"{c.base_name}->{c.pdf_plan_norm}"
             for c in classifications if c.outcome == PdfOutcome.CLASH
         ]
         return EmailAction(
             EmailActionKind.FLAG_AND_HOLD,
-            f"mixed evidence: PDF(s) {', '.join(empty_names)} empty while "
-            f"PDF(s) {', '.join(clash_summary)} clash with subject "
+            f"mixed evidence: PDF(s) {', '.join(no_evidence_names)} carry no "
+            f"plan while PDF(s) {', '.join(clash_summary)} clash with subject "
             f"{plan_match.pretty_plan(subject_plan_norm)}",
         )
 

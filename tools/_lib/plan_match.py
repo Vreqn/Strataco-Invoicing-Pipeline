@@ -118,6 +118,47 @@ def pick_from_subject(
     return None, None
 
 
+# Mirrors the empty-allowed_prefixes branch of `_build_plan_text_regex`, but the
+# "STRATA" / "STRATA PLAN" lead-in is REQUIRED — we only treat a token as a plan
+# reference when the document literally labels it one. An optional "No." / "#"
+# is allowed both after the lead-in ("Strata Plan No. EPS6008") and after the
+# prefix ("EPS No. 6008"). Keeps the C/O guard so "STRATA PLAN EPS6763 C/O ..."
+# doesn't capture suffix "C".
+_EXPLICIT_PLAN_RE = re.compile(
+    r"\b(?:STRATA\s+PLAN\s+|STRATA\s+)"
+    r"(?:(?:NO\.?|NUMBER|NUM\.?)\s*)?(?:#\s*)?"
+    r"([A-Z]{2,6})\s*(?:[.\-_/]*\s*)?"
+    r"(?:(?:NO\.?|NUMBER|NUM\.?)\s*)?(?:#\s*)?(\d{1,5})"
+    r"(?:\s*[-_.]?\s*([A-Z]{1,3})(?!\s*\/\s*[A-Z]))?\b"
+)
+
+
+def find_explicit_plan_tokens(text: str) -> list[str]:
+    """Plan tokens the PDF text *explicitly labels* as a strata plan.
+
+    Unlike `match_from_pdf_text`, this does NOT depend on the managed plan list
+    — it fires only when the text literally says "Strata Plan <token>" (or
+    "Strata <token>"). Used to tell "PDF carries no plan number at all" (safe to
+    route on the email subject) apart from "PDF names a plan, just not one we
+    manage" (flag for review). Deliberately does not guess at bare letter+digit
+    tokens: a PO number or account number on an ordinary invoice must not be
+    mistaken for a plan reference, or the reply-to-self recovery loops again.
+
+    Returns normalised tokens (e.g. "KAS9999"), de-duplicated, first-seen order.
+    """
+    if not text:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _EXPLICIT_PLAN_RE.finditer(str(text).upper()):
+        norm = f"{m.group(1)}{m.group(2)}{m.group(3) or ''}"
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(norm)
+    return out
+
+
 # ----------------------------------------------------------------------
 # Filename matching (Step 3 node 7, Step 5 node 8, Step 6 node 8)
 # ----------------------------------------------------------------------

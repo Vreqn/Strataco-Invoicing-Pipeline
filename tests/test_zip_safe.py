@@ -85,6 +85,46 @@ def test_extract_pdfs_ignores_mac_metadata() -> None:
     assert [name for name, _ in out] == ["inv_001.pdf"]
 
 
+def test_extract_pdfs_ignores_txt_companion() -> None:
+    """A `.txt` companion file (e.g. TELUS Bill Analyzer's `manifest.txt`)
+    sitting next to the real invoice PDF must NOT poison the whole ZIP. A
+    `.txt` is never an invoice or usable content, so it's skipped like Mac
+    resource-fork noise; the PDF still routes. Regression for the 7-error
+    0.14.1 run on 2026-05-13."""
+    data = _build_zip([
+        ("inv_001.pdf", b"%PDF-1.4 real invoice"),
+        ("manifest.txt", b"plan summary text, not an invoice"),
+    ])
+    out = audit_and_extract_pdfs(data)
+    assert [name for name, _ in out] == ["inv_001.pdf"]
+    assert dict(out)["inv_001.pdf"] == b"%PDF-1.4 real invoice"
+
+
+def test_extract_pdfs_txt_only_zip_returns_empty_list() -> None:
+    """A ZIP carrying only a `.txt` (no PDF) is not unsafe — the `.txt` is
+    skipped and the result is empty, same contract as an empty ZIP. The
+    caller treats `[]` as 'no contained PDFs'."""
+    data = _build_zip([("manifest.txt", b"just a text file")])
+    out = audit_and_extract_pdfs(data)
+    assert out == []
+
+
+def test_extract_pdfs_still_rejects_docx_with_txt_present() -> None:
+    """Skipping `.txt` must not loosen the strict rule for other non-PDF
+    entries. A `.docx` could be a real invoice the vendor should resend as
+    PDF, so a ZIP with a `.docx` still raises — even when a skippable
+    `.txt` is also present. The reason names the `.docx`, not the `.txt`."""
+    data = _build_zip([
+        ("inv_001.pdf", b"%PDF-1.4 real"),
+        ("manifest.txt", b"skippable text"),
+        ("cover_letter.docx", b"PK fake docx bytes"),
+    ])
+    with pytest.raises(UnsafeZipError) as exc:
+        audit_and_extract_pdfs(data)
+    assert "cover_letter.docx" in str(exc.value)
+    assert "manifest.txt" not in str(exc.value)
+
+
 def test_extract_pdfs_empty_zip_returns_empty_list() -> None:
     """An empty ZIP carries no useful content but is also not unsafe.
     Callers (Step 1) treat this as 'no contained PDFs' and the

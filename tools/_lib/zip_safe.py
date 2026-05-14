@@ -11,10 +11,11 @@ Two entry points, one set of safety checks:
 
   - `audit_and_extract_pdfs(zip_bytes)` — for Step 1's in-memory
     intake inspection. Strict: anything that isn't a directory, a Mac
-    resource fork, or a `.pdf` raises `UnsafeZipError`. Step 1's
-    caller turns the raise into a "this email needs the operator —
-    leave it in the Inbox flagged" decision, which is the whole point
-    of the change that introduced this module.
+    resource fork, a skippable `.txt` companion file, or a `.pdf`
+    raises `UnsafeZipError`. Step 1's caller turns the raise into a
+    "this email needs the operator — leave it in the Inbox flagged"
+    decision, which is the whole point of the change that introduced
+    this module.
 
 Both share `_audit_safety`, which enforces the byte/entry/ratio limits
 from `tools._lib.config`. Encrypted entries are always rejected (we
@@ -35,6 +36,15 @@ class UnsafeZipError(Exception):
 
     Surfaces a human-readable reason in `str(exc)` for the daily log.
     """
+
+
+# Non-PDF entries that are never a real invoice and should not poison a
+# ZIP. A `.txt` is informational by nature (e.g. TELUS Bill Analyzer
+# staples a `manifest.txt` next to the invoice PDF) — skipped like the
+# `__MACOSX/` resource-fork noise rather than raising. `.docx` / `.xlsx`
+# are deliberately NOT here: they could be a real invoice the vendor
+# should resend as PDF, so they keep poisoning the ZIP.
+IGNORABLE_COMPANION_EXTS = (".txt",)
 
 
 def _is_mac_metadata(filename: str) -> bool:
@@ -133,15 +143,17 @@ def audit_and_extract_pdfs(zip_bytes: bytes) -> list[tuple[str, bytes]]:
       - if the bytes aren't a valid ZIP (`BadZipFile`)
       - on bomb / encryption / oversize per `_audit_safety`
       - if the archive contains any non-PDF real-file entries (after
-        filtering directories and Mac resource forks)
+        filtering directories, Mac resource forks, and skippable
+        `.txt` companion files per `IGNORABLE_COMPANION_EXTS`)
 
     The strict no-non-PDF policy is what lets Step 1 honor the "Inbox
     is the single source of truth" invariant for ZIP-bearing emails:
     a vendor who staples a `.docx` cover letter to a PDF invoice
     forces the whole email to stay in the Inbox with a red flag,
-    where the operator handles it manually. See
-    `workflows/step_1_intake.md` and the resolved 2026-05-13 ZIP-
-    orphan entry in `To-Speak-About.txt`.
+    where the operator handles it manually. A `.txt` is the one
+    exception — it's never an invoice, so it's skipped rather than
+    raised. See `workflows/step_1_intake.md` and the resolved
+    2026-05-13 ZIP-orphan entry in `To-Speak-About.txt`.
     """
     try:
         zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
@@ -164,6 +176,8 @@ def audit_and_extract_pdfs(zip_bytes: bytes) -> list[tuple[str, bytes]]:
                 continue
             if leaf.lower().endswith(".pdf"):
                 pdf_entries.append(info)
+            elif leaf.lower().endswith(IGNORABLE_COMPANION_EXTS):
+                continue
             else:
                 disallowed.append(leaf)
 

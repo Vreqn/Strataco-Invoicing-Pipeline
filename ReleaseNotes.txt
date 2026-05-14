@@ -11,6 +11,128 @@ Versioning: MAJOR.MINOR.PATCH
 
 
 ---------------------------------------------------------------------------
+0.15.0  —  2026-05-13  —  A PDF with no plan number routes on the subject
+---------------------------------------------------------------------------
+
+The reply-to-self recovery loop had a permanent dead end. When an email's
+subject carried a valid managed plan but the PDF attachment contained no
+strata plan number anywhere in its text, Step 1's cross-validation
+classified that PDF as AMBIGUOUS — which forces FLAG_AND_HOLD. The front
+desk's fix (reply-to-self with the plan in the subject) then went through
+the conversation-link path, which re-ran the SAME cross-validation against
+the SAME plan-less PDF and flagged it again. The email never routed and
+never logged as processed: a flag loop with no exit.
+
+Fix: a new per-PDF outcome `PdfOutcome.NO_PLAN` sits between EMPTY and
+AMBIGUOUS. `_classify_pdf_against_subject` now splits its old "else ->
+AMBIGUOUS" branch three ways:
+
+  - EMPTY    — no text layer at all (scanned image). Unchanged.
+  - NO_PLAN  — text exists but the matcher detected ZERO plan-shaped
+               tokens. The PDF simply carries no strata plan number.
+               No evidence against the subject -> route on the subject,
+               same stance as EMPTY.
+  - AMBIGUOUS — text exists AND plan-shaped tokens were detected but
+               none resolved (an unmanaged plan number, or a genuine
+               tie between two managed plans). Still flagged.
+
+`_decide_email_action` treats NO_PLAN exactly like EMPTY: all
+AGREE/EMPTY/NO_PLAN routes as subject; a NO_PLAN PDF mixed with a CLASH
+sibling still flags. The double-check still runs first — NO_PLAN is only
+reached after PDF-text and filename matching both come back with nothing.
+
+The loop fix is automatic for the reply path: `_process_prior_attachments`
+reuses the same two functions, so a reply-to-self for a plan-less PDF now
+routes the invoice and moves both messages to `processed_emails` instead
+of re-flagging. Because the email now hits ROUTE_AS_SUBJECT, it is counted
+as processed (not need_review) in logs/daily_summary.csv.
+
+Deliberately narrow — Case 3 stays flagged: a PDF that names a plan not in
+Strataplan_List.xlsx (a closed plan, a plan another firm manages, a vendor
+typo) is still AMBIGUOUS and held in the Inbox. There are two detection
+paths, because `match_from_pdf_text` only ever looks for prefixes that
+appear in the active plan list:
+  - Managed prefix, unmanaged number ("EPS 9999" when EPS plans exist):
+    `match_from_pdf_text` detects it, `result.detected` is non-empty ->
+    AMBIGUOUS.
+  - Unmanaged prefix entirely ("KAS 9999" when no KAS plans exist):
+    `match_from_pdf_text` is blind to it. A Codex adversarial review
+    caught this gap — the first cut keyed NO_PLAN purely off
+    `not result.detected`, so "Strata Plan KAS 9999" looked identical to
+    a plan-less invoice and would have auto-routed to the subject's
+    manager. Fixed with a new standalone detector
+    `plan_match.find_explicit_plan_tokens`, which scans for tokens the
+    document literally labels "Strata Plan ..." independently of the
+    managed list. NO_PLAN now requires BOTH that scan and
+    `result.detected` to be empty. The detector deliberately does NOT
+    guess at bare letter+digit tokens — a PO or account number on an
+    ordinary invoice must not be mistaken for a plan, or the
+    reply-to-self loop comes back. `match_from_pdf_text` itself is
+    untouched (HANDOFF.md-protected).
+
+Such an invoice has no manager/AP mapping and can't route through Steps
+3-6 at all; what to do with it is a policy question logged in
+To-Speak-About.txt (2026-05-13 entry "PDF references an unmanaged strata
+plan").
+
+Regression tests added:
+  - tests/test_step1_decision.py:
+    test_no_plan_routes_as_subject,
+    test_no_plan_plus_clash_flags
+  - tests/test_step1_filename_first.py:
+    test_pdf_text_with_no_plan_token_is_no_plan,
+    test_pdf_text_with_unmanaged_plan_token_stays_ambiguous (Case 3,
+    managed prefix),
+    test_pdf_text_names_unmanaged_plan_stays_ambiguous (Case 3,
+    unmanaged prefix — the Codex bug reproducer)
+  - tests/test_plan_match.py:
+    test_find_explicit_plan_tokens
+
+
+---------------------------------------------------------------------------
+0.14.2  —  2026-05-13  —  A `.txt` companion file no longer poisons a ZIP
+---------------------------------------------------------------------------
+
+The first 0.14.1 Step 1 run produced 7 errors, all the same root cause:
+7 "FW: Your TELUS Bill Analyzer report is attached" emails, each
+carrying a ZIP that holds the invoice PDF plus a `manifest.txt`. The
+strict in-memory audit (`zip_safe.audit_and_extract_pdfs`) rejected any
+non-PDF entry, so the lone `manifest.txt` made the whole ZIP unsafe:
+the email got the Outlook red flag, nothing was written to disk, and
+the invoice PDF inside never routed. TELUS Bill Analyzer is a recurring
+sender, so this recurred ~7 emails per billing cycle.
+
+Fix: a `.txt` inside a ZIP is now skipped rather than raised — treated
+like the `__MACOSX/` resource-fork noise `_is_mac_metadata` already
+filters. A `.txt` is informational by nature and never an invoice, so
+the PDF(s) alongside it route normally.
+
+  - New module constant `IGNORABLE_COMPANION_EXTS = (".txt",)` in
+    tools/_lib/zip_safe.py.
+  - `audit_and_extract_pdfs` skips entries whose extension is in that
+    tuple instead of adding them to `disallowed`.
+
+Deliberately narrow: `.docx` / `.xlsx` are NOT ignored. Those could be
+a real invoice the vendor should resend as PDF, so they keep poisoning
+the ZIP and flagging the email — unchanged strict behaviour. A ZIP
+holding only a `.txt` (no PDF) returns an empty list, same contract as
+an empty ZIP. `audit_zipfile` (Step 2's lenient path) already dropped
+`.txt` silently — no change there.
+
+Regression tests added:
+  - tests/test_zip_safe.py:
+    test_extract_pdfs_ignores_txt_companion (the bug reproducer),
+    test_extract_pdfs_txt_only_zip_returns_empty_list,
+    test_extract_pdfs_still_rejects_docx_with_txt_present
+  - tests/test_step1_zip_intake.py:
+    test_subject_matched_zip_with_txt_companion_routes_pdfs
+    (real-world TELUS scenario end-to-end)
+
+The three test_zip_safe.py tests fail under 0.14.1 and pass under
+0.14.2.
+
+
+---------------------------------------------------------------------------
 0.14.1  —  2026-05-13  —  ZIP stem must not leak into filename matcher
 ---------------------------------------------------------------------------
 
