@@ -57,7 +57,7 @@ Each PDF gets classified into one of five outcomes (`PdfOutcome` in `steps/step_
 |---|---|
 | **AGREE** | PDF text confidently identifies the same plan as the subject. |
 | **EMPTY** | PDF has no extractable text (scanned image / no text layer). No evidence either way. |
-| **NO_PLAN** | PDF has extractable text but carries **no strata plan number at all** — neither a managed-plan token (`match_from_pdf_text`) **nor** a token the document explicitly labels "Strata Plan …" (`plan_match.find_explicit_plan_tokens`). No evidence either way; treated exactly like EMPTY. Flagging this would loop the reply-to-self recovery (0.15.0). |
+| **NO_PLAN** | PDF has extractable text but carries **no strata plan number at all** — neither a managed-plan token (`match_from_pdf_text`) **nor** a token the document explicitly labels "Strata Plan …" (`plan_match.find_explicit_plan_tokens`). When it's the *lone* PDF this carries no evidence either way and is treated like EMPTY (route on subject — the genuine "vendor invoice that never prints the plan #" case, 0.15.0). When it has *siblings*, it flags the whole email — see the email-level action table below (0.15.2). |
 | **AMBIGUOUS** | PDF text names a plan but it didn't resolve — a managed-prefix token the matcher couldn't pick, two equally-scored managed candidates, **or** a plan the PDF explicitly labels "Strata Plan …" whose prefix/number isn't in `Strataplan_List.xlsx` (e.g. "Strata Plan KAS 9999"). The explicit-wording scan is what catches unmanaged-*prefix* plans — `match_from_pdf_text`'s detector only sees managed prefixes. |
 | **CLASH** | PDF confidently identifies a *different* managed plan than the subject. |
 
@@ -65,7 +65,10 @@ The per-PDF classifications are combined into a single email-level action by `_d
 
 | Case | Action |
 |---|---|
-| Every PDF is AGREE, EMPTY, or NO_PLAN | **ROUTE_AS_SUBJECT** — stamp using subject's plan. EMPTY and NO_PLAN carry no evidence against the subject, so the subject is trusted. |
+| Every PDF is AGREE | **ROUTE_AS_SUBJECT** — stamp using subject's plan. |
+| Lone PDF, EMPTY or NO_PLAN | **ROUTE_AS_SUBJECT** — a single PDF with no evidence against the subject is trusted to the subject's plan. |
+| Multi-PDF, any NO_PLAN | **FLAG** — a plan-less PDF sitting next to siblings hasn't cleared the dual-factor bar; we can't tell a plan-less real invoice from a plan-less boilerplate notice the vendor stapled on. Hold the whole email for the front desk rather than stamping and filing a guess. (0.15.2 — fixes the 2026-05-14 `FSC_Fuel_Surcharge_.pdf` mis-route. Whether multi-PDF **EMPTY** should be held the same way is an open policy question — see `To-Speak-About.txt`.) |
+| Multi-PDF, AGREE + EMPTY only (no NO_PLAN) | **ROUTE_AS_SUBJECT** — current behaviour; a scanned sibling is still trusted to the subject. |
 | Any PDF is AMBIGUOUS | **FLAG** — strict-first, don't trust ambiguous evidence. |
 | Mix of EMPTY/NO_PLAN and CLASH | **FLAG** — can't safely route a no-plan PDF when its sibling disagrees with the subject. |
 | All PDFs CLASH on the same plan (≠ subject) | **FLAG** — consensus clash, vendor likely mislabelled the subject. |

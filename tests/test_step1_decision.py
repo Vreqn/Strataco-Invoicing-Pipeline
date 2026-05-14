@@ -98,10 +98,12 @@ def test_agree_and_empty_routes_as_subject() -> None:
     )
 
 
-def test_no_plan_routes_as_subject() -> None:
-    """A PDF with extractable text but no strata plan number at all carries no
-    evidence against the subject — route on the subject's plan (same stance as
-    EMPTY). Flagging it would loop the front desk's reply-to-self recovery.
+def test_lone_no_plan_routes_as_subject() -> None:
+    """A single-PDF email whose only PDF has extractable text but no strata
+    plan number at all carries no evidence against the subject — route on the
+    subject's plan (same stance as a lone EMPTY). This is the genuine "vendor
+    invoice that never prints the plan number" case; flagging it would loop the
+    front desk's reply-to-self recovery.
     """
     a = _decide_email_action(
         "BCS2707",
@@ -111,15 +113,29 @@ def test_no_plan_routes_as_subject() -> None:
         f"[single NO_PLAN] expected ROUTE_AS_SUBJECT, got {a.kind}"
     )
 
+
+def test_multi_pdf_no_plan_flags() -> None:
+    """In a multi-PDF email, a PDF carrying no plan number of its own hasn't
+    cleared the dual-factor bar — we can't tell a plan-less real invoice from a
+    plan-less boilerplate notice the vendor stapled on. Hold the whole email
+    for the front desk rather than stamping and filing a guess.
+
+    Regression: 0.15.0's NO_PLAN routed these on the subject, which silently
+    stamped and filed FSC_Fuel_Surcharge_.pdf as a BCS 3396 invoice
+    (2026-05-14 diagnostic-run incident).
+    """
     a = _decide_email_action(
         "BCS2707",
         [
-            _cls(PdfOutcome.AGREE, plan="BCS2707", base_name="clear.pdf"),
-            _cls(PdfOutcome.NO_PLAN, base_name="plainvoice.pdf"),
+            _cls(PdfOutcome.AGREE, plan="BCS2707", base_name="invoice.pdf"),
+            _cls(PdfOutcome.NO_PLAN, base_name="FSC_Fuel_Surcharge_.pdf"),
         ],
     )
-    assert a.kind == EmailActionKind.ROUTE_AS_SUBJECT, (
-        f"[AGREE + NO_PLAN] expected ROUTE_AS_SUBJECT, got {a.kind}"
+    assert a.kind == EmailActionKind.FLAG_AND_HOLD, (
+        f"[AGREE + NO_PLAN] expected FLAG_AND_HOLD, got {a.kind}"
+    )
+    assert "FSC_Fuel_Surcharge_.pdf" in a.reason, (
+        f"[AGREE + NO_PLAN] reason should name the plan-less PDF, got {a.reason!r}"
     )
 
     a = _decide_email_action(
@@ -129,8 +145,19 @@ def test_no_plan_routes_as_subject() -> None:
             _cls(PdfOutcome.NO_PLAN, base_name="plainvoice.pdf"),
         ],
     )
-    assert a.kind == EmailActionKind.ROUTE_AS_SUBJECT, (
-        f"[EMPTY + NO_PLAN] expected ROUTE_AS_SUBJECT, got {a.kind}"
+    assert a.kind == EmailActionKind.FLAG_AND_HOLD, (
+        f"[EMPTY + NO_PLAN] expected FLAG_AND_HOLD, got {a.kind}"
+    )
+
+    a = _decide_email_action(
+        "BCS2707",
+        [
+            _cls(PdfOutcome.NO_PLAN, base_name="a.pdf"),
+            _cls(PdfOutcome.NO_PLAN, base_name="b.pdf"),
+        ],
+    )
+    assert a.kind == EmailActionKind.FLAG_AND_HOLD, (
+        f"[NO_PLAN + NO_PLAN] expected FLAG_AND_HOLD, got {a.kind}"
     )
 
 

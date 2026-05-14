@@ -11,6 +11,60 @@ Versioning: MAJOR.MINOR.PATCH
 
 
 ---------------------------------------------------------------------------
+0.15.2  —  2026-05-14  —  Multi-PDF emails with a plan-less sibling are held,
+                          not auto-routed (0.15.0 regression fix)
+---------------------------------------------------------------------------
+
+0.15.0 gave Step 1 a new cross-validation outcome, PdfOutcome.NO_PLAN —
+"the PDF has text but names no strata plan, so trust the subject and
+route it." That was the right call for a lone vendor invoice that simply
+never prints its plan number. It was the WRONG call for a multi-PDF
+email, and a 2026-05-14 diagnostic run showed why.
+
+The email "FW: BCS3396 Invoice 26376 from Fraser Stratacare Ltd." had
+two PDFs: the real invoice (AGREE) and FSC_Fuel_Surcharge_.pdf — a
+generic price-increase notice letter the vendor staples to invoices.
+The notice has no plan number, so 0.15.0 classified it NO_PLAN;
+_decide_email_action saw "all AGREE/NO_PLAN" and routed BOTH on the
+subject. The notice was stamped "Received: MAY 14 2026 / BCS 3396" and
+filed into a manager's To_Approve queue as if it were an invoice. The
+same email had been correctly held on 2026-05-13, before 0.15.0.
+
+The miss: NO_PLAN can't tell a plan-less real invoice from a plan-less
+boilerplate notice. For a lone PDF that's a tolerable bet — it's the
+only thing in the email. With siblings present it isn't: the system has
+lost the dual-factor confirmation (subject AND PDF agree) for that one
+attachment and can't be sure it isn't filing junk — or missing a second
+real invoice.
+
+Fix: NO_PLAN routes on the subject ONLY when it's the lone attachment.
+In a multi-PDF email, any NO_PLAN sibling now flags the whole email
+(FLAG_AND_HOLD) — nothing is written to disk, the email stays in the
+Inbox with the Outlook red flag for the front desk. The lone-invoice win
+0.15.0 was built for is untouched; AUTO_SPLIT and clean multi-invoice
+routing (every PDF confirms its own plan) are untouched. This restores
+the pre-0.15.0 hold for the boilerplate-sibling shape.
+
+Front-desk recovery for a held email: forward / reply-to-self with ONLY
+the real invoice attached — Step 1 then sees a clean single-PDF email
+and routes it. Never a manual folder drop.
+
+This collides with the still-open To-Speak-About.txt entry "Boilerplate-
+sibling PDF flags" — 0.15.0 had inadvertently shipped a behaviour change
+against that undecided entry. 0.15.2 only undoes the accidental
+loosening; it does not pick one of that entry's options. Two sub-
+questions are now logged there for the owner: should multi-PDF EMPTY
+(scanned, no text layer) be held the same way, and what the exact front-
+desk recovery wording should be.
+
+Tests: tests/test_step1_decision.py — replaced the old
+test_no_plan_routes_as_subject (which asserted the buggy multi-PDF
+behaviour) with test_lone_no_plan_routes_as_subject (the lone-PDF win
+survives) and test_multi_pdf_no_plan_flags (AGREE+NO_PLAN, EMPTY+NO_PLAN,
+NO_PLAN+NO_PLAN all FLAG_AND_HOLD). Full suite: 213 passed.
+
+
+---------------------------------------------------------------------------
 0.15.1  —  2026-05-14  —  Conversation-link priors: fix the double-move 404,
                           recover a stranded source on a failed move
 ---------------------------------------------------------------------------

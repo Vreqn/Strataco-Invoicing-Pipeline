@@ -282,6 +282,49 @@ Decision:
 _to be filled in after Krisztian discusses with his dad / client_
 
 
+--- 2026-05-14 addendum (0.15.0 regression + 0.15.1 partial fix) ---
+
+0.15.0's new PdfOutcome.NO_PLAN inadvertently shipped a behaviour change
+against this still-open entry. NO_PLAN was built for "a real vendor
+invoice that just never prints its plan number" — but a boilerplate
+notice ALSO has no plan number, so NO_PLAN swallowed the boilerplate-
+sibling case. On the 2026-05-14 diagnostic run, `FSC_Fuel_Surcharge_.pdf`
+(the example above) was classified NO_PLAN, and `_decide_email_action`
+saw "all AGREE/NO_PLAN" → ROUTE_AS_SUBJECT → the boilerplate was stamped
+and filed into Doug Wilson's To_Approve as "BCS 3396 - FSC_Fuel_
+Surcharge_.pdf". That is worse than any of Options 1-4 above — none of
+them said "stamp the boilerplate and file it as an invoice."
+
+0.15.1 reverts the NO_PLAN half to strict-hold: a NO_PLAN PDF routes on
+the subject ONLY when it's the lone attachment; in a multi-PDF email any
+NO_PLAN sibling flags the whole email (FLAG_AND_HOLD, nothing written to
+disk). This restores the pre-0.15.0 hold for the boilerplate-sibling
+shape. Krisztian's stated lean (2026-05-14): multi-attachment emails
+where a sibling can't be confirmed should be held — "the key is never
+missing an invoice; a stray non-invoice landing in a queue is fine, the
+manager just deletes it."
+
+Still open, for Krisztian to settle with his dad / client:
+
+  (a) Should multi-PDF EMPTY (a scanned PDF, no text layer) also be
+      held? Same "we can't tell if it's an invoice" logic applies, but
+      EMPTY siblings route-on-subject today (and pre-0.15.0), so
+      tightening it is a real behaviour change for every email that
+      bundles a scanned invoice. The code change is one extra condition
+      — can land the moment the decision comes back. Until then EMPTY is
+      unchanged.
+
+  (b) What is the exact front-desk recovery recipe for a held
+      boilerplate-sibling email? Recommended: forward / reply-to-self
+      with ONLY the real invoice attached (drop the boilerplate) so
+      Step 1 sees a clean single-PDF email and routes it — NEVER a
+      manual folder drop (universal no-manual-drops rule). Needs
+      confirming, then writing into docs/client_training_brief.md.
+
+  (c) The original Options 1-4 question (per-PDF rescue / known-
+      boilerplate ignore list) is still open and unanswered — 0.15.1
+      only undoes the accidental loosening, it does not pick an option.
+
 ### Technical references (hand these to a developer)
 
   - `steps/step_1_intake.py::_decide_email_action` — the matrix.

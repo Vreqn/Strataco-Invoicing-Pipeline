@@ -572,7 +572,11 @@ def _decide_email_action(
 
     Decision matrix (see workflows/step_1_intake.md):
 
-      - all AGREE/EMPTY/NO_PLAN               → ROUTE_AS_SUBJECT
+      - all AGREE                             → ROUTE_AS_SUBJECT
+      - lone PDF, EMPTY or NO_PLAN            → ROUTE_AS_SUBJECT
+      - multi-PDF, any NO_PLAN                → FLAG (can't tell a plan-less
+                                                invoice from a plan-less
+                                                boilerplate notice)
       - any AMBIGUOUS                         → FLAG (strict-first)
       - any EMPTY/NO_PLAN mixed with any CLASH → FLAG (can't safely route it)
       - all PDFs confident, ≥1 CLASH:
@@ -584,8 +588,10 @@ def _decide_email_action(
       * "Confident" here means the PDF returned an active plan with a manager
         (PdfOutcome.AGREE or PdfOutcome.CLASH). EMPTY, NO_PLAN, and AMBIGUOUS
         are not confident.
-      * EMPTY and NO_PLAN are treated identically: neither carries evidence
-        that contradicts the subject, so the subject's plan is trusted.
+      * EMPTY always routes on the subject. NO_PLAN routes on the subject
+        only as the lone PDF; a NO_PLAN sibling in a multi-PDF email flags
+        the whole email — we can't tell a plan-less real invoice from a
+        plan-less boilerplate notice the vendor stapled on.
       * The base-collision check covers the subject's plan implicitly: if a
         PDF's plan AGREES, its plan_norm equals subject_plan_norm, and that
         plan appears in `unique_plans`, so the base check catches a "subject
@@ -606,6 +612,24 @@ def _decide_email_action(
         agreed = sum(1 for o in outcomes if o == PdfOutcome.AGREE)
         empty = sum(1 for o in outcomes if o == PdfOutcome.EMPTY)
         no_plan = sum(1 for o in outcomes if o == PdfOutcome.NO_PLAN)
+        # NO_PLAN routes on the subject only when it's the *lone* PDF — the
+        # genuine "vendor invoice that never prints the plan number" case. In a
+        # multi-PDF email a NO_PLAN sibling hasn't cleared the dual-factor bar:
+        # we can't tell a plan-less real invoice from a plan-less boilerplate
+        # notice the vendor stapled on. Hold the whole email for the front desk
+        # rather than stamping and filing a guess. (Regression guard: 0.15.0
+        # routed these on the subject and silently filed FSC_Fuel_Surcharge_.pdf
+        # as a BCS 3396 invoice — 2026-05-14 incident.)
+        if len(classifications) > 1 and no_plan:
+            no_plan_names = [
+                c.base_name for c in classifications
+                if c.outcome == PdfOutcome.NO_PLAN
+            ]
+            return EmailAction(
+                EmailActionKind.FLAG_AND_HOLD,
+                f"multi-PDF email with PDF(s) carrying no plan number: "
+                f"{', '.join(no_plan_names)} — held for front-desk review",
+            )
         return EmailAction(
             EmailActionKind.ROUTE_AS_SUBJECT,
             f"PDF cross-check OK ({agreed} agree, {empty} empty, "
