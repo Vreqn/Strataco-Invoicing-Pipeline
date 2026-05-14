@@ -90,7 +90,8 @@ The Python pipeline runs on **the N8N server** (the centralized Strataco deploy 
 **Install once:**
 
 - **Python 3.11 or newer**, from python.org. Tick "Add Python to PATH" during install. Verify with `python --version` from a fresh shell.
-- **Microsoft C++ Build Tools — only if `pip install` fails.** Most fresh Windows installs work without this because every package in `requirements.txt` ships pre-built wheels for Python 3.11+. But if step 2 of "One-time setup" below errors out with `Microsoft Visual C++ 14.0 or greater is required`, install the standalone "Build Tools for Visual Studio" from <https://visualstudio.microsoft.com/visual-cpp-build-tools/> and select the **Desktop development with C++** workload. (If the deploy machine's Python came bundled with Anaconda, you already have an equivalent compiler chain via Anaconda's own packages — skip this.)
+- **Git for Windows**, from <https://git-scm.com/download/win>. Required to clone the repo and to pull updates from GitHub. Default installer options are fine — in particular, leave **Git Credential Manager** enabled (it handles GitHub authentication for HTTPS remotes, no Personal Access Token needed). Verify with `git --version` from a fresh shell.
+- **Microsoft C++ Build Tools — only if `pip install` fails.** Most fresh Windows installs work without this because every package in `requirements.txt` ships pre-built wheels for Python 3.11+. But if the dependency-install step of "One-time setup" below errors out with `Microsoft Visual C++ 14.0 or greater is required`, install the standalone "Build Tools for Visual Studio" from <https://visualstudio.microsoft.com/visual-cpp-build-tools/> and select the **Desktop development with C++** workload. (If the deploy machine's Python came bundled with Anaconda, you already have an equivalent compiler chain via Anaconda's own packages — skip this.)
 
 **Network access:**
 
@@ -135,20 +136,32 @@ Maintain the deploy machine, the Strataplan list, and the Azure registration.
 
 ## One-time setup
 
-1. **Install Python 3.11 or newer** on the deployment machine.
+1. **Install Python 3.11 or newer** on the deployment machine. (See Prerequisites.)
 
-2. **Install dependencies:**
+2. **Clone the repo from GitHub.** Open PowerShell and pick the path the project should live at. The existing deploy machine uses `Q:\AI Automation\Strataco Invoicing\`, so commands and Task Scheduler entries elsewhere in this README reference that path:
+
+   ```powershell
+   cd "Q:\AI Automation"
+   git clone https://github.com/Vreqn/Strataco-Invoicing-Pipeline.git "Strataco Invoicing"
+   cd "Strataco Invoicing"
+   ```
+
+   The trailing `"Strataco Invoicing"` argument names the local folder — without it, `git clone` would create `Strataco-Invoicing-Pipeline` instead. Pick whichever you prefer; the rest of this README assumes the path you actually `cd` into is the project root.
+
+   First-time `git clone` against the HTTPS remote opens the Git Credential Manager browser flow for GitHub authentication. Sign in once and the credential is cached — no Personal Access Token setup needed. From then on, see "Keeping the deploy machine in sync with GitHub" below for the `git pull` workflow.
+
+3. **Install dependencies** (from the project root):
    ```
    python -m pip install -r requirements.txt
    ```
 
-3. **Create `.env`** by copying `.env.example` and filling in the real values. From the project root in PowerShell:
+4. **Create `.env`** by copying `.env.example` and filling in the real values. From the project root in PowerShell:
    ```powershell
    Copy-Item .env.example .env
    notepad .env
    ```
 
-   The copy turns the template into a live `.env` — the tools only read `.env`, never `.env.example`. Edit the new file in Notepad and fill in the real values for the keys listed below.
+   The copy turns the template into a live `.env` — the tools only read `.env`, never `.env.example`. `.env` is gitignored on purpose, so it never gets pushed to GitHub even though every other file in the project does. Edit the new file in Notepad and fill in the real values for the keys listed below.
 
    Required keys:
 
@@ -160,13 +173,13 @@ Maintain the deploy machine, the Strataplan list, and the Azure registration.
    | `NOTIFY_DEFAULT_EMAIL` | The real recipient for the daily Step 6 "Invoices summary" email (e.g. the AP supervisor). Required — Step 6 raises at startup if neither this nor `NOTIFY_OVERRIDE_EMAIL` is set. |
    | `NOTIFY_OVERRIDE_EMAIL` | All notification emails are rerouted here during the shadow phase. Set to empty when going live to send to real managers/APs. |
 
-4. **Create two Inbox subfolders** in OWA for the mailbox in `MAILBOX_UPN`. Both are **required** — skip this and the pipeline runs but leaves emails sitting in the Inbox until you come back to fix it.
+5. **Create two Inbox subfolders** in OWA for the mailbox in `MAILBOX_UPN`. Both are **required** — skip this and the pipeline runs but leaves emails sitting in the Inbox until you come back to fix it.
    - `processed_emails` — Step 1 moves handled emails here.
    - `duplicate_emails` — Step 1 moves emails whose attachments were all duplicates here. **Added in 0.9.0** — verify this folder exists when you upgrade.
 
    To create each: in OWA, right-click `Inbox` → `Create new subfolder` → type the exact name above (lowercase, with underscore). Verify both folders appear under Inbox before running Step 1.
 
-5. **Verify everything boots:**
+6. **Verify everything boots:**
    ```
    python steps/step_2_unzip.py
    ```
