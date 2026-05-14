@@ -1,9 +1,18 @@
-# Step 3 — Sort PDFs left in `_Unmatched/Invoices` (post-ZIP extraction)
+# Step 3 — Safety-net PDF sort for `_Unmatched/Invoices`
+
+## Role (post-2026-05-13)
+
+This step is a **safety net only**, just like Step 2. The email intake path (Step 1) handles subject + body + PDF text + filename matching inline AND inspects ZIPs in memory at intake (see `workflows/step_1_intake.md`). Email-originated PDFs and ZIP-contained PDFs are routed directly by Step 1 or held in the Inbox with the Outlook red flag — they no longer flow through `_Unmatched/Invoices/`.
+
+Step 3 continues to run on its existing 06:20 cron so that:
+
+1. If an operator drags a manually-fixed PDF into `_Unmatched/Invoices/`, the automation picks it up the next morning without anyone needing to remember to run the job by hand.
+2. If a future Step 1 change ever leaves a PDF in `_Unmatched/`, the safety net drains it.
+
+On a normal day this job logs "found 0 PDF(s) to sort" and exits in milliseconds. The follow-up decision to decommission Steps 2 and 3 once the logs prove they're idle is tracked as a `To-Speak-About.txt` entry.
 
 ## Objective
 Identify the Strata Plan for every PDF still in `_Unmatched/Invoices` and route it. Match by filename first; if that fails, extract the PDF text and use the safe scoring algorithm. Apply the Received stamp and route to the manager.
-
-**Context — what's actually in `_Unmatched/Invoices/` after this change?** Step 1 now does subject + body + PDF text matching inline (and pulls PDFs from prior messages via conversation-link when the operator replies-to-self without re-attaching). As a result, single-PDF invoice emails are almost always routed by Step 1 directly — they no longer land here. The main feeder for this step is now Step 2: ZIPs that get unzipped at 06:10. Non-PDF attachments (Word, images) also pass through if Step 1 saved them here for manual sort, but Step 3 doesn't try to match those — only `*.pdf` files.
 
 ## Schedule
 06:20 Mon–Fri.
@@ -29,7 +38,7 @@ python steps/step_3_pdf_sort.py
 - [tools/_lib/stamp.py](../tools/_lib/stamp.py) — `render_received_stamp`.
 
 ## Edge cases
-- **Scanned PDFs (no extractable text)**: `extract_full_text` returns "", `match_from_pdf_text` reports "No text extracted", file is left in place. For single-PDF emails this case is already handled in Step 1 by leaving the email in Inbox; here it applies to PDFs that came out of ZIPs and so don't have a parent email to fall back on — operator renames the file manually or asks the vendor.
+- **Scanned PDFs (no extractable text)**: `extract_full_text` returns "", `match_from_pdf_text` reports "No text extracted", file is left in place. In the email pipeline this case is already handled in Step 1 — the parent email stays in the Inbox flagged for the operator. In the safety-net context (manual drop), the operator renames the file with the right plan prefix and the next run picks it up via the filename-first path.
 - **Ambiguous match**: when the top score does not beat the runner-up by ≥ 3, the file is left in place (logged: "Ambiguous").
 - **"C/O" trap**: explicitly handled by the regex's `(?!\s*\/\s*[A-Z])` lookahead.
 - **Suffixed plans**: `LMS4193C` in filename matches `LMS4193C` in XLS first; if filename has the base `LMS4193`, it falls back to base only when all suffix variants point to the same manager.

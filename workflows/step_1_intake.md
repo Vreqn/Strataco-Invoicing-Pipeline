@@ -23,7 +23,9 @@ For each Inbox message:
 
 Step 1 only downloads and processes **PDF and ZIP** attachments. Other attachments — signature images (Outlook-*.png, image001.png, ServiceBox-Navy.png), `.docx`, `.xlsx`, `~WRD*.jpg`, etc. — are **discarded at intake** with an INFO log line. They are not downloaded, not saved to disk, not counted as blockers.
 
-ZIP attachments go to their own bucket: `_process_self_attachments` and `_process_pdf_text_fallback` both save them to `_Unmatched/Invoices/` on the happy path so Step 2 can unpack them. ZIPs do **not** gate `_decide_email_action` or the all-or-nothing rule — Step 2 + Step 3 handle their contents downstream.
+ZIP attachments are inspected in memory via `tools/_lib/zip_safe.py::audit_and_extract_pdfs`. Each contained PDF is downloaded into RAM, classified the same way a top-level PDF is, and becomes a full participant in `_decide_email_action` / the all-or-nothing rule. ZIPs themselves are **never written to disk by Step 1** — their useful payload (the PDFs inside) is routed directly to manager folders. Routed names use the convention `<zipbase>__<inner>.pdf` so the audit trail shows where the file came from.
+
+The audit is strict: a ZIP that contains any non-PDF entries (`.docx`, `.txt`, etc.), is encrypted, exceeds the bomb-protection caps (`ZIP_MAX_*` in `.env`), or has corrupt bytes raises `UnsafeZipError`. Step 1 then keeps the parent email in the Inbox with the Outlook red flag and writes nothing to disk — the strictest interpretation of "Inbox is the single source of truth," and the resolution of the 2026-05-13 ZIP-orphan entry in `To-Speak-About.txt`. macOS resource-fork files (`__MACOSX/`, `._foo.pdf`) are silently ignored so Mac-authored ZIPs don't trip the strict check.
 
 If a real invoice arrives as a `.docx` or `.xlsx`, the operator asks the vendor to resend as PDF (per client policy as of 0.11.2).
 
@@ -76,28 +78,30 @@ The per-PDF classifications are combined into a single email-level action by `_d
 **Strict-first stance:** when in doubt, flag for review. Mis-sorting silently is much worse than over-flagging. This policy can be relaxed (e.g. auto-route some suffix-variant cases, or trust the PDF outright on single-PDF clashes) once we have evidence from real operator usage that the strata managers' labelling is reliable.
 
 ## Outputs
-- Matched PDFs (subject/body match) at `<STRATACO_ROOT>/Users/<Manager>/Invoices/To_Approve/<plan> - <name>.pdf` (Received stamp applied).
-- ZIP attachments **on subject/body-matched emails AND on emails routed via the PDF-text-fallback happy path** at `<STRATACO_ROOT>/_Unmatched/Invoices/<name>.zip` for Step 2 to extract.
+- Matched PDFs (subject/body match OR fallback) at `<STRATACO_ROOT>/Users/<Manager>/Invoices/To_Approve/<plan> - <name>.pdf` (Received stamp applied). ZIP-contained PDFs use `<zipbase>__<inner>.pdf` as their base name so the audit trail preserves the source ZIP.
+- ZIP attachments are inspected in memory and their PDFs routed directly — **the ZIP file itself is never saved to `_Unmatched/Invoices/` by Step 1**. (The directory continues to exist for the Step 2/3 safety-net jobs that drain operator manual drops.)
 - Non-PDF/non-ZIP attachments (signature images, .docx, .xlsx) are **discarded at intake** with an INFO log — not saved anywhere.
 - Subject/body-matched emails are moved to `Inbox/processed_emails`.
-- Successfully PDF-text-fallback-routed emails (every PDF text-matched a plan AND any ZIPs saved cleanly) are routed and moved to `processed_emails`.
-- **All-or-nothing leave-in-Inbox rule:** any email that doesn't get a subject/body match AND has an unmatched PDF, invalid PDF bytes, or download failure stays in the Inbox with nothing written to disk. ZIPs and discarded attachments do NOT trigger the rule. The email itself is the recovery surface; the operator replies-to-self with the corrected subject and the next morning's conversation-link pass routes everything in the thread together.
+- Successfully PDF-text-fallback-routed emails (every PDF — top-level OR ZIP-contained — text- or filename-matched a plan; every ZIP passed the safety audit) are routed and moved to `processed_emails`.
+- **All-or-nothing leave-in-Inbox rule:** any email that doesn't get a subject/body match AND has an unmatched PDF, invalid PDF bytes, an unsafe ZIP (non-PDF entries, bomb, encrypted), or a download failure stays in the Inbox **with the Outlook red flag set** and nothing written to disk. Discarded non-PDF/non-ZIP attachments do NOT trigger the rule. The email itself is the recovery surface; the operator replies-to-self with the corrected subject and the next morning's conversation-link pass routes everything in the thread together.
 - One row appended to `logs/daily_summary.csv` (7 columns: `date, step, processed, need_review, errors, duration_sec, status`) and a detailed log at `logs/step_1_<date>.log`.
 
 ## All-or-nothing rule (for emails without a subject/body plan match)
 
-When the subject and body don't yield a plan, Step 1 still tries to match each PDF by **PDF text first, filename second** (per `_classify_pdf_against_subject`'s order). But it commits the email's fate **all at once**:
+When the subject and body don't yield a plan, Step 1 still tries to match each PDF by **PDF text first, filename second** (per `_classify_pdf_against_subject`'s order). ZIPs are inspected in memory and each contained PDF goes through the same matcher. The email's fate is committed **all at once**:
 
-- **Every PDF text- or filename-matched a plan AND any ZIPs save cleanly** → route the PDFs, save the ZIPs to `_Unmatched/Invoices/` for Step 2, move the email to `processed_emails`.
-- **Anything less** (any unmatched PDF, invalid PDF bytes, download failure) → leave the entire email in the Inbox. **Nothing is written to disk.** Even the would-have-matched PDFs and the otherwise-saveable ZIPs are not committed.
+- **Every PDF (top-level or ZIP-contained) text- or filename-matched a plan, every ZIP passed the safety audit** → route the PDFs, move the email to `processed_emails`. ZIPs themselves are not written to disk; their contained PDFs have already been routed.
+- **Anything less** (any unmatched PDF, invalid PDF bytes, unsafe ZIP, download failure) → leave the entire email in the Inbox **with the Outlook red flag**. **Nothing is written to disk.** Even the would-have-matched PDFs are not committed.
 
-ZIPs by themselves are always routable (Step 2 unpacks them downstream), and discarded attachments don't exist past Pass 1, so neither category gates the decision — only unmatched/invalid PDFs and download failures do. An email with one routable PDF and one ZIP commits both. An email with one ambiguous-text PDF and one ZIP commits neither.
+Discarded non-PDF/non-ZIP attachments (signature PNGs, `.docx` attached at the top level, `.xlsx`) don't exist past Pass 1, so they don't gate the decision. ZIP-contained `.docx`/`.txt` etc. DO gate the decision — the strict `zip_safe` audit treats them as unsafe.
 
-Why all-or-nothing rather than save unmatched stuff to `_Unmatched/`? Because operators don't routinely check `_Unmatched/Invoices/` — their workflow looks at the Inbox. Saving something to `_Unmatched/` is effectively hiding it. Keeping the email in the Inbox preserves the "Inbox is the single source of truth" principle.
+Why all-or-nothing rather than save unmatched stuff to `_Unmatched/`? Because operators don't routinely check `_Unmatched/Invoices/` — their workflow looks at the Inbox. Saving something to `_Unmatched/` is effectively hiding it. Keeping the email in the Inbox preserves the "Inbox is the single source of truth" principle. The 2026-05-13 ZIP-orphan fix removed the last remaining ZIP exemption from this rule.
 
-The all-or-nothing log line (via `run.review()`) lists each attachment's outcome: which PDFs would have routed, which didn't, which ZIPs were deferred (not saved due to all-or-nothing), and any invalid PDF bytes detected. IT can grep the log if the operator asks "which one was the problem?"
+The all-or-nothing log line (via `run.review()`) lists each attachment's outcome: which PDFs would have routed (with `<zipbase>__<inner>` naming for ZIP-contained ones), which didn't and why, which ZIPs failed the safety audit and what tripped it, and any invalid PDF bytes detected. IT can grep the log if the operator asks "which one was the problem?"
 
-The rough edges of this design — multi-strata PDFs in one email, ZIPs without identifying info, non-invoice PDFs that get routed alongside invoice PDFs — are documented in `To-Speak-About.txt` for client policy direction.
+**Outlook red flag on the leave-in-Inbox path.** Whenever the email that hits the all-or-nothing branch carried any PDF-shaped content the system couldn't fully resolve — at least one classified PDF (matched or unmatched, top-level or from a ZIP), a download failure, invalid PDF bytes, or an unsafe ZIP — Step 1 calls `_flag_message_safely` so the message picks up the same red flag the operator already trains on for subject↔PDF clashes. Emails that hit this branch with **only** non-invoice attachments (signature PNGs, top-level `.docx`, `.xlsx`) stay unflagged: a discard-only email has nothing for the operator to review.
+
+The rough edges of this design — multi-strata PDFs in one email, non-invoice PDFs that get routed alongside invoice PDFs — are documented in `To-Speak-About.txt` for client policy direction.
 
 ## Partial-commit Outlook flag (both branches)
 
@@ -115,31 +119,21 @@ python steps/step_1_intake.py
 - [tools/_lib/pdf_text.py](../tools/_lib/pdf_text.py) — `extract_full_text` (pdfplumber on a bytes blob; no disk write).
 - [tools/_lib/stamp.py](../tools/_lib/stamp.py) — `render_received_stamp` (red, 7 rows, 5 editable AcroForm fields).
 - [tools/_lib/safe_io.py](../tools/_lib/safe_io.py) — `safe_write_unique`, `sanitize_filename`.
+- [tools/_lib/zip_safe.py](../tools/_lib/zip_safe.py) — `audit_and_extract_pdfs` (in-memory strict ZIP extraction), `UnsafeZipError`.
 
-## Operator recovery workflow (unidentified invoices)
+## Front-desk recovery workflow (unidentified invoices)
 
-When the automation can't identify a strata plan from subject, body, or PDF text, the email stays in the Inbox. The operator handles it manually with one of two paths:
+When the automation can't identify a strata plan from subject, body, or PDF text, the email stays in the Inbox. The front-desk recipe lives in [`docs/client_training_brief.md`](../docs/client_training_brief.md) under "Recovery Workflow."
 
-1. **Reply-to-self with corrected subject (primary path).** Hit Reply on the unmatched email, change the To: from the vendor's address to `testinvsml@stratacomgmt.com`, edit the subject to include the strata number (e.g. `BCS 2707 — Re: Invoice attached`), Send. **No PDF re-attachment needed.** Next 06:00 pass matches the subject, looks up the conversation, pulls the PDF from the original message, routes it, and moves both messages to `processed_emails`.
+System side: the unidentified email is the recovery surface. No file is written to disk. The reply-to-self triggers the next 06:00 pass's conversation-link path: the matched-subject reply finds its prior message in the same `conversationId`, pulls the PDF from that prior, routes it, and moves both messages to `processed_emails`.
 
-2. **Bounce to the vendor.** Reply to the vendor asking which strata. When the vendor responds in the same thread (with or without re-attaching the PDF), the response gets processed normally — if it carries identifying text in subject/body, the conversation-link path resolves the PDF from earlier in the thread.
+## Front-desk workflow for flagged emails
 
-The Reply gotcha: the To: field auto-fills with the vendor's address. If the operator forgets to change it, the reply goes to the vendor with `BCS 2707` in the subject — harmless, just re-send to the right address. An Outlook desktop **Quick Step** can pre-fill the To: field; see README for setup.
+The front-desk recipe for resolving red-flagged emails lives in [`docs/client_training_brief.md`](../docs/client_training_brief.md) under "Flag-Review Workflow." This file documents the system behaviour that produces the flag; the front desk's response is canonical there.
 
-## Operator workflow for flagged emails (red flag in Outlook)
+Per the universal "no manual drops" rule in CLAUDE.md, no recipe — for the front desk or the developer — ever drops a PDF directly into a manager folder. The Received stamp is only applied during Step 1; manual drops strip it and silently break Step 5/6. Recovery for any flagged email is always: get the email back into the Inbox with a corrected subject (reply-to-self for the front desk; the same recipe or a manual `python steps/step_1_intake.py` run for the developer) so Step 1 re-routes it.
 
-When the system can't decide between the subject and the PDF text — or when a multi-PDF email contains suffix-variant strata — it sets the Outlook "Flag as to-do" on the message. The operator sees a red flag next to the email in their Inbox view. The whole email stays in the Inbox; nothing is written to disk.
-
-What the operator does:
-
-1. **Open the flagged email** and check the daily log (`logs/step_1_<date>.log`) for the `pdf-classify:` lines — they show each PDF's classification (`AGREE`/`CLASH`/`EMPTY`/`AMBIGUOUS`), the plan the PDF claims, and the top detected tokens.
-2. **Decide which plan(s) apply.** Two flavours of flag exist:
-   - **Subject-vs-PDF clash** (single PDF, or consensus across PDFs): either the vendor mistyped the subject or the PDF mentions another plan in passing. Inspect the PDF, pick the right plan.
-   - **Suffix-variant clash** (e.g. one PDF for `LMS 4193C`, another for `LMS 4193T` in the same email): vendors confuse these. Confirm each PDF's plan in the document, then route them separately.
-3. **Resolve the email**, using one of:
-   - **Reply-to-self with the corrected subject** (when one plan applies to everything): the next 06:00 pass picks it up and routes via the conversation-link path.
-   - **Manually split**: drag each PDF to the correct manager's `To_Approve` folder by hand and apply the Received stamp via the editor's template. Then move the original email to `processed_emails`.
-4. **Mark the Outlook flag complete.** The red flag becomes a green checkmark, signalling that this one is done.
+For the rare partial-commit flag, the front desk escalates to the developer rather than resolving it themselves (see Edge cases below for the system-side detail).
 
 ## Edge cases
 - **Inbox subfolder missing**: if `processed_emails` does not exist under Inbox, the step logs an error but still saves attachments. Mail does NOT get moved that day; create the folder and the next run handles the backlog.
@@ -147,7 +141,7 @@ What the operator does:
 - **Imposter `.pdf` files (PNG/JPEG bytes in a PDF-named file)**: caught by `_is_real_pdf` magic-byte check after download. Email is flagged via `run.review()` and left in the Inbox; the operator can inspect.
 - **Multiple attachments per email**: behaviour depends on the matching branch.
   - *Subject/body matched* → the new PDF cross-validation (see above) decides per-PDF, then `_decide_email_action` picks ROUTE_AS_SUBJECT / AUTO_SPLIT / FLAG_AND_HOLD for the email as a whole.
-  - *No subject/body match* → the all-or-nothing rule from `_process_pdf_text_fallback` still applies. The email moves to `processed_emails` only if every PDF text- or filename-matched a plan and any ZIPs save cleanly; any unmatched PDF, invalid PDF bytes, or download failure forces leave-in-Inbox with nothing written. ZIPs and discarded non-PDF/non-ZIP attachments do NOT gate the rule.
+  - *No subject/body match* → the all-or-nothing rule from `_process_pdf_text_fallback` still applies. The email moves to `processed_emails` only if every PDF (top-level or ZIP-contained) text- or filename-matched a plan and every ZIP passed the in-memory safety audit; any unmatched PDF, invalid PDF bytes, unsafe ZIP, or download failure forces leave-in-Inbox with nothing written. Discarded non-PDF/non-ZIP top-level attachments do NOT gate the rule.
 - **Scanned (image-only) PDFs**: `extract_full_text` returns empty and `match_from_pdf_text` reports `"No text extracted (scanned PDF?)."`. Behaviour depends on the branch:
   - *Subject/body matched* → classified as `EMPTY`; routes on the subject's plan (no clash evidence on either side).
   - *No subject/body match* → treated as unmatched; the email stays in Inbox for operator recovery via reply-to-self.
@@ -158,7 +152,7 @@ What the operator does:
 - **Reply and original processed in the same run**: two cases.
   - *Happy path (all priors clean)* → the prior is added to `consumed_prior_ids` on the first successful PDF route, so a later loop iteration over the same original skips it and moves both to `processed_emails`.
   - *Clash or partial-commit path* → the prior is added to `flagged_prior_ids` instead, so a later loop iteration over the same original *skips processing* AND *does not move* it. Both the reply and the original stay in the Inbox; the reply has the red flag.
-- **Partial commit on a multi-PDF email**: if some PDFs route to disk and a later PDF in the same batch returns `FAILED`, the email gets the Outlook to-do flag and a `partial commit on '<subject>'` error log. Committed files are already on disk and in the duplicate ledger — there's no rollback. Operator reconciles by hand. This applies to both `_process_self_attachments` and the conversation-link path.
+- **Partial commit on a multi-PDF email**: if some PDFs route to disk and a later PDF in the same batch returns `FAILED`, the email gets the Outlook to-do flag and a `partial commit on '<subject>'` error log. Committed files are already on disk and in the duplicate ledger — there's no rollback. The front desk escalates this flag to the developer rather than resolving it themselves (per CLAUDE.md's universal no-manual-drops rule — even the developer doesn't drop files by hand; recovery is "fix the upstream cause and re-trigger Step 1" or a targeted ledger surgery for the failed file). This applies to both `_process_self_attachments` and the conversation-link path.
 - **Outlook flag-set fails (Graph error)**: `_flag_message_safely` logs `FLAG_SET_FAILED: ...` at error level and returns False. The email still stays in the Inbox per its branch's normal logic, but **without the red flag** — so it looks like an ordinary unmatched email. Admins should grep `FLAG_SET_FAILED:` in the daily log and investigate Graph `Mail.ReadWrite` scope.
 - **Plan with no manager_name in the snapshot**: `_route_pdf` logs an error and treats the PDF as unroutable rather than crashing the step. In the cross-validation path, the PDF's match also gets demoted to "no confident plan" (we can't route to a manager-less plan).
 - **Conversation lookup fails (Graph error)**: logged with the conversation ID prefix. The reply stays in Inbox. Not silently swallowed.

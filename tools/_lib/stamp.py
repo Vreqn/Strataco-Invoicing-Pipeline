@@ -34,6 +34,8 @@ from pypdf.generic import (
 from reportlab.lib.colors import Color
 from reportlab.pdfgen import canvas as rl_canvas
 
+from tools._lib.pdf_text import extract_page_words
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------- constants
@@ -68,9 +70,73 @@ PAGE_MARGIN_PT = 36            # No-go zone around the page edges (0.5 inch). Th
                                # algorithm from clustering stamps right next to
                                # bottom-of-page footers.
 
-# Fallback placement (matches the N8n flow's default coords for the lower-right area)
-FALLBACK_X_PT = 360
-FALLBACK_Y_PT = 60   # PDF y is bottom-up; 60 pt from the bottom places it near the bottom-right
+# Fallback placement — used only when ALL search tiers fail (essentially
+# impossible on a real invoice). Lower-LEFT, not lower-right, because
+# invoices almost universally put the grand total in the lower-right.
+# Defense-in-depth: even if forbidden-band detection broke and every
+# search tier exhausted, the worst-case landing is the side of the page
+# that's overwhelmingly empty. Pre-0.13 this lived in the lower-right
+# (x=360) and the algorithm dropped Received stamps directly onto the
+# Amount Due / Balance Due rows on dense invoices.
+FALLBACK_X_PT = PAGE_MARGIN_PT  # left edge of the inner page area
+FALLBACK_Y_PT = 60              # PDF y is bottom-up; 60 pt from the bottom
+
+# Semantic exclusion zones — the stamp must never cover the totals block
+# or the invoice-number row. These outrank pixel-whitespace: even a clean
+# patch of pixels gets vetoed if it would land across one of these rows.
+# See `_extract_forbidden_bands`.
+BAND_PAD_PT = 4   # vertical breathing room so the stamp can't visually brush the row
+_LINE_GROUP_Y_TOLERANCE_PT = 2.0  # words within this many points share a "line"
+_TRAILING_PUNCT_FOR_NORMALIZATION = ":,;."
+
+# Labels that mark the totals block. Token-boundary matched after
+# normalization (lowercase, trailing :,;. stripped), so `Subtotal` and
+# `Total` are distinct matches (no substring confusion). Krisztian's
+# directive (2026-05-13): exclude the whole summary block, not just the
+# bottom-line "grand total" — vendors disagree on which row is "the"
+# total, and covering Subtotal/GST also looks wrong.
+_TOTAL_LABELS_RAW: tuple[str, ...] = (
+    "Subtotal",
+    "Total",
+    "Invoice Total",
+    "Grand Total",
+    "Total Due",
+    "Amount Due",
+    "Amount Owing",
+    "Balance Due",
+    "Balance Owing",
+    "Amount Paid",
+    "Account Balance",
+    "GST",
+    "PST",
+    "HST",
+)
+
+# Labels that mark the invoice-number row.
+_INVOICE_NUMBER_LABELS_RAW: tuple[str, ...] = (
+    "Invoice #",
+    "Invoice No",
+    "Invoice Number",
+    "Inv #",
+    "Inv No",
+)
+
+
+def _normalize_token(text: str) -> str:
+    return text.lower().rstrip(_TRAILING_PUNCT_FOR_NORMALIZATION)
+
+
+_TOTAL_LABEL_TOKENS: tuple[tuple[str, ...], ...] = tuple(
+    tuple(_normalize_token(t) for t in label.split())
+    for label in _TOTAL_LABELS_RAW
+)
+_INVOICE_NUMBER_LABEL_TOKENS: tuple[tuple[str, ...], ...] = tuple(
+    tuple(_normalize_token(t) for t in label.split())
+    for label in _INVOICE_NUMBER_LABELS_RAW
+)
+_ALL_FORBIDDEN_LABEL_TOKENS: tuple[tuple[str, ...], ...] = (
+    _TOTAL_LABEL_TOKENS + _INVOICE_NUMBER_LABEL_TOKENS
+)
 
 
 # ---------------------------------------------------------------- whitespace
@@ -83,6 +149,96 @@ class StampPlacement:
     width_pt: float
     height_pt: float
     fallback_used: bool
+
+
+def _group_words_into_lines(
+    words: list[dict],
+    y_tolerance_pt: float = _LINE_GROUP_Y_TOLERANCE_PT,
+) -> list[list[dict]]:
+    """Cluster pdfplumber word records into reading lines by `top` coordinate."""
+    if not words:
+        return []
+    sorted_words = sorted(words, key=lambda w: (round(w["top"], 1), w["x0"]))
+    lines: list[list[dict]] = []
+    current: list[dict] = []
+    current_top: float | None = None
+    for w in sorted_words:
+        if current_top is None or abs(w["top"] - current_top) <= y_tolerance_pt:
+            current.append(w)
+            if current_top is None:
+                current_top = w["top"]
+        else:
+            lines.append(current)
+            current = [w]
+            current_top = w["top"]
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _line_matches_any_label(
+    line_tokens: tuple[str, ...],
+    label_token_sets: tuple[tuple[str, ...], ...],
+) -> bool:
+    """True if any label appears as a contiguous run in the line's tokens."""
+    n = len(line_tokens)
+    for label in label_token_sets:
+        m = len(label)
+        if m == 0 or m > n:
+            continue
+        for i in range(n - m + 1):
+            if line_tokens[i : i + m] == label:
+                return True
+    return False
+
+
+def _extract_forbidden_bands(pdf_bytes: bytes) -> list[tuple[float, float]]:
+    """Return forbidden y-bands `(top_pt, bottom_pt)` where the stamp must
+    not land. Coordinates are top-down PDF points (origin = top of page),
+    matching pdfplumber's `top`/`bottom` convention.
+
+    Each band corresponds to a line of text whose normalized tokens match
+    one of the totals-block or invoice-number labels. Bands are padded by
+    `BAND_PAD_PT` on both sides so the stamp can't visually brush the row.
+
+    Returns `[]` on any extraction failure — better to lose semantic
+    protection than to crash the stamp pipeline. The hard-coded fallback
+    is also in the lower-LEFT now, so even with empty bands the
+    last-resort landing is the safe side of the page.
+    """
+    try:
+        words = extract_page_words(pdf_bytes, page_index=0)
+    except Exception as exc:
+        logger.warning(
+            "forbidden-band text extraction failed (%s); proceeding without semantic exclusions",
+            exc,
+        )
+        return []
+
+    if not words:
+        return []
+
+    bands: list[tuple[float, float]] = []
+    for line in _group_words_into_lines(words):
+        tokens = tuple(_normalize_token(w["text"]) for w in line)
+        if _line_matches_any_label(tokens, _ALL_FORBIDDEN_LABEL_TOKENS):
+            top = min(float(w["top"]) for w in line) - BAND_PAD_PT
+            bottom = max(float(w["bottom"]) for w in line) + BAND_PAD_PT
+            bands.append((top, bottom))
+    return bands
+
+
+def _intersects_any_band(
+    y_px: int,
+    h_px: int,
+    bands_px: list[tuple[int, int]],
+) -> bool:
+    """True if pixel rectangle `[y_px, y_px+h_px)` overlaps any band."""
+    candidate_bottom = y_px + h_px
+    for band_top, band_bottom in bands_px:
+        if y_px < band_bottom and candidate_bottom > band_top:
+            return True
+    return False
 
 
 def _rasterize_page_one(pdf_bytes: bytes, dpi: int = RASTER_DPI) -> tuple[Image.Image, float, float]:
@@ -106,26 +262,36 @@ def find_largest_whitespace_box(
 ) -> StampPlacement:
     """Find a rectangle of mostly-white pixels that fits the stamp.
 
-    Constraints:
-      * Stamp bounding box must sit entirely inside the page-edge margin
-        (PAGE_MARGIN_PT on every side). Keeps stamps off the physical edge
-        and prevents the algorithm from choosing edge-adjacent placements
-        over the much cleaner middle of the page.
+    Hard constraints (in priority order):
+      1. Forbidden bands — the stamp must never cover a totals-block row
+         (Subtotal / Total / Amount Due / etc.) or the invoice-number
+         row. These are computed from page-1 text via pdfplumber and
+         outrank pixel whitespace: a clean patch is vetoed if it
+         intersects any forbidden band. See `_extract_forbidden_bands`.
+      2. Page-edge margin — bounding box must sit entirely inside
+         `PAGE_MARGIN_PT` on every side. Keeps stamps off the physical
+         edge and away from edge-adjacent footers.
 
-    Two-tier search:
-      1. Strict pass — overall whitespace ≥ WHITE_PCT_MIN AND every horizontal
-         pixel row inside the window ≥ PER_ROW_WHITE_PCT_MIN. Rejects "mostly
-         white but text running through" areas (like a totals row).
-      2. Loose pass — overall whitespace ≥ WHITE_PCT_FALLBACK only. Used only
-         when the strict pass finds no candidate, so dense invoices still get
-         a placement instead of falling all the way to the fixed coords.
+    Three-tier search (each tier respects both constraints above):
+      1. Strict — overall whitespace ≥ WHITE_PCT_MIN AND every horizontal
+         pixel row in the window ≥ PER_ROW_WHITE_PCT_MIN. Rejects
+         "mostly white but text running through" areas.
+      2. Loose — overall whitespace ≥ WHITE_PCT_FALLBACK only. Catches
+         dense invoices where strict misses.
+      3. Last-resort — `min_total = 0`, no whitespace floor at all.
+         Picks the cleanest exclusion-free rectangle even if it overlaps
+         line-item text. Krisztian's directive: covering line items is
+         acceptable; covering the grand total or invoice number is not.
 
-    Scoring: pure "cleanest area wins" — no positional bias. The margin
-    constraint handles the "stay away from edges" goal directly.
+    Scoring within each tier: pure "cleanest area wins" by white-pixel
+    count, with last-seen tiebreaker (scan order is top-to-bottom,
+    left-to-right, so ties resolve to bottom-right of the equivalent set).
 
-    Returns a StampPlacement in PDF point coordinates (origin = bottom-left).
-    Falls back to (FALLBACK_X_PT, FALLBACK_Y_PT) when neither pass finds a
-    candidate.
+    Returns a `StampPlacement` in PDF point coordinates (origin = bottom-left).
+    Falls back to `(FALLBACK_X_PT, FALLBACK_Y_PT)` — now lower-LEFT — only
+    when ALL three tiers find nothing (essentially impossible on a real
+    invoice; would require the target rectangle to be larger than the
+    entire unforbidden region of the page).
     """
     image, page_w_pt, page_h_pt = _rasterize_page_one(pdf_bytes)
     arr = np.asarray(image, dtype=np.uint8)
@@ -141,6 +307,19 @@ def find_largest_whitespace_box(
     if target_w_px + 2 * margin_px > W or target_h_px + 2 * margin_px > H:
         logger.warning("stamp + margin larger than page; falling back to default position")
         return StampPlacement(FALLBACK_X_PT, FALLBACK_Y_PT, target_width_pt, target_height_pt, True)
+
+    # Forbidden bands in PDF points, then converted to image pixel rows.
+    # pdfplumber's top-down y matches PIL's top-down y, so no flip needed.
+    bands_pt = _extract_forbidden_bands(pdf_bytes)
+    bands_px: list[tuple[int, int]] = [
+        (
+            max(0, int(round(top_pt * px_per_pt))),
+            min(H, int(round(bottom_pt * px_per_pt))),
+        )
+        for top_pt, bottom_pt in bands_pt
+    ]
+    if bands_px:
+        logger.info("stamp forbidden bands (pixels, top-down): %s", bands_px)
 
     binary = (arr >= WHITE_THRESHOLD).astype(np.int32)
     # Pad integral image with a zero row/column so we don't need branches in the
@@ -184,6 +363,8 @@ def find_largest_whitespace_box(
         best_score = -1
         best_xy: tuple[int, int] | None = None
         for y in range(y_lo, y_hi + 1, stride_y):
+            if _intersects_any_band(y, target_h_px, bands_px):
+                continue
             for x in range(x_lo, x_hi + 1, stride_x):
                 total = _rect_sum(y, x, target_h_px, target_w_px)
                 if total < min_total:
@@ -206,9 +387,18 @@ def find_largest_whitespace_box(
     if best_xy is None:
         best_xy = _search(needed_loose, require_clean_rows=False)
         tier = "loose"
+    if best_xy is None:
+        # Last-resort: any exclusion-free rectangle. May cover line-item text;
+        # totals and invoice number stay visible.
+        best_xy = _search(min_total=0, require_clean_rows=False)
+        tier = "last_resort"
 
     if best_xy is None:
-        logger.warning("no whitespace region found — using fallback placement")
+        logger.error(
+            "stamp last-resort exhausted (target too large for unforbidden region); "
+            "using lower-left fallback at (%d, %d) pt",
+            FALLBACK_X_PT, FALLBACK_Y_PT,
+        )
         return StampPlacement(FALLBACK_X_PT, FALLBACK_Y_PT, target_width_pt, target_height_pt, True)
 
     x_px, y_px = best_xy

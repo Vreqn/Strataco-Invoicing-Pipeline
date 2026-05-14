@@ -11,3 +11,5 @@ pikepdf
 numpy
 portalocker
 tzdata
+pytest
+pytest-mock

@@ -10,9 +10,6 @@ Covers `_scan_unmatched_intake` and `_scan_manager_stuck` in
     bad folder must not kill the whole morning email contract.
   - Identify managers from the directory segment, not the Strataplan XLS,
     so disk-vs-XLS drift can't silently hide stuck files.
-
-Standalone: no pytest. Run with `python tests/test_step6_scans.py`.
-Exits 0 on success, 1 on any failure.
 """
 
 from __future__ import annotations
@@ -35,17 +32,6 @@ from steps.step_6_paid_archive import (
     _scan_manager_stuck,
     _scan_unmatched_intake,
 )
-
-
-FAILED: list[str] = []
-
-
-def _check(name: str, cond: bool, detail: str = "") -> None:
-    if cond:
-        print(f"  ok   {name}")
-    else:
-        print(f"  FAIL {name}{(': ' + detail) if detail else ''}")
-        FAILED.append(name)
 
 
 class _RootContext:
@@ -74,26 +60,23 @@ class _RootContext:
 
 
 def test_intake_missing_folder() -> None:
-    print("test_intake_missing_folder")
     with _RootContext():
         result = _scan_unmatched_intake()
-        _check("is_scan_result", isinstance(result, _ScanResult))
-        _check("rows_empty", result.rows == [])
-        _check("errors_empty", result.errors == [])
+        assert isinstance(result, _ScanResult), "is_scan_result"
+        assert result.rows == [], "rows_empty"
+        assert result.errors == [], "errors_empty"
 
 
 def test_intake_empty_folder() -> None:
-    print("test_intake_empty_folder")
     with _RootContext() as root:
         (root / "_Unmatched" / "Invoices").mkdir(parents=True)
         result = _scan_unmatched_intake()
-        _check("rows_empty", result.rows == [])
-        _check("errors_empty", result.errors == [])
+        assert result.rows == [], "rows_empty"
+        assert result.errors == [], "errors_empty"
 
 
 def test_intake_mixed_contents() -> None:
     """PDF + Processed marker + non-PDF: only the non-Processed entries surface."""
-    print("test_intake_mixed_contents")
     with _RootContext() as root:
         folder = root / "_Unmatched" / "Invoices"
         folder.mkdir(parents=True)
@@ -102,24 +85,23 @@ def test_intake_mixed_contents() -> None:
         (folder / "baz.docx").write_text("docx bytes")
         result = _scan_unmatched_intake()
         names = {r["fileName"] for r in result.rows}
-        _check("two_rows", len(result.rows) == 2, f"got {len(result.rows)}: {names}")
-        _check("foo_present", "foo.pdf" in names)
-        _check("baz_present", "baz.docx" in names)
-        _check("processed_filtered", "Processed - bar.pdf" not in names)
-        _check("all_have_local_path", all(r.get("localPath") for r in result.rows))
-        _check("all_have_mtime", all(r.get("mtimeIso") for r in result.rows))
+        assert len(result.rows) == 2, f"two_rows: got {len(result.rows)}: {names}"
+        assert "foo.pdf" in names, "foo_present"
+        assert "baz.docx" in names, "baz_present"
+        assert "Processed - bar.pdf" not in names, "processed_filtered"
+        assert all(r.get("localPath") for r in result.rows), "all_have_local_path"
+        assert all(r.get("mtimeIso") for r in result.rows), "all_have_mtime"
 
 
 def test_intake_unicode_filename() -> None:
-    print("test_intake_unicode_filename")
     with _RootContext() as root:
         folder = root / "_Unmatched" / "Invoices"
         folder.mkdir(parents=True)
         weird = "facture_éàñü.pdf"
         (folder / weird).write_text("pdf bytes")
         result = _scan_unmatched_intake()
-        _check("one_row", len(result.rows) == 1)
-        _check("filename_preserved", result.rows[0]["fileName"] == weird)
+        assert len(result.rows) == 1, "one_row"
+        assert result.rows[0]["fileName"] == weird, "filename_preserved"
 
 
 def test_intake_iterdir_error() -> None:
@@ -129,17 +111,14 @@ def test_intake_iterdir_error() -> None:
     that exists but can't be read. We can't easily revoke read perms in a
     cross-platform way, so we lean on the platform-portable NotADirectoryError.
     """
-    print("test_intake_iterdir_error")
     with _RootContext() as root:
         (root / "_Unmatched").mkdir()
         (root / "_Unmatched" / "Invoices").write_text("oops, not a directory")
         result = _scan_unmatched_intake()
-        _check("rows_empty", result.rows == [])
-        _check("one_error", len(result.errors) == 1, f"got: {result.errors}")
-        _check(
-            "error_mentions_path",
-            "_Unmatched/Invoices" in result.errors[0],
-            f"got: {result.errors[0]!r}",
+        assert result.rows == [], "rows_empty"
+        assert len(result.errors) == 1, f"one_error: got: {result.errors}"
+        assert "_Unmatched/Invoices" in result.errors[0], (
+            f"error_mentions_path: got: {result.errors[0]!r}"
         )
 
 
@@ -147,25 +126,22 @@ def test_intake_iterdir_error() -> None:
 
 
 def test_manager_missing_users_dir() -> None:
-    print("test_manager_missing_users_dir")
     with _RootContext():
         result = _scan_manager_stuck()
-        _check("is_scan_result", isinstance(result, _ScanResult))
-        _check("rows_empty", result.rows == [])
-        _check("errors_empty", result.errors == [])
+        assert isinstance(result, _ScanResult), "is_scan_result"
+        assert result.rows == [], "rows_empty"
+        assert result.errors == [], "errors_empty"
 
 
 def test_manager_empty_users_dir() -> None:
-    print("test_manager_empty_users_dir")
     with _RootContext() as root:
         (root / "Users").mkdir()
         result = _scan_manager_stuck()
-        _check("rows_empty", result.rows == [])
-        _check("errors_empty", result.errors == [])
+        assert result.rows == [], "rows_empty"
+        assert result.errors == [], "errors_empty"
 
 
 def test_manager_two_managers_stuck() -> None:
-    print("test_manager_two_managers_stuck")
     with _RootContext() as root:
         alice = root / "Users" / "Alice" / "Invoices" / "Approved"
         bob = root / "Users" / "Bob" / "Invoices" / "Approved"
@@ -174,24 +150,23 @@ def test_manager_two_managers_stuck() -> None:
         (alice / "foo.pdf").write_text("pdf")
         (bob / "bar.pdf").write_text("pdf")
         result = _scan_manager_stuck()
-        _check("two_rows", len(result.rows) == 2, f"got {len(result.rows)}")
-        _check("no_errors", result.errors == [])
+        assert len(result.rows) == 2, f"two_rows: got {len(result.rows)}"
+        assert result.errors == [], "no_errors"
         by_mgr = {r["managerName"]: r["fileName"] for r in result.rows}
-        _check("alice_mapped", by_mgr.get("Alice") == "foo.pdf")
-        _check("bob_mapped", by_mgr.get("Bob") == "bar.pdf")
-        _check("all_have_local_path", all(r.get("localPath") for r in result.rows))
+        assert by_mgr.get("Alice") == "foo.pdf", "alice_mapped"
+        assert by_mgr.get("Bob") == "bar.pdf", "bob_mapped"
+        assert all(r.get("localPath") for r in result.rows), "all_have_local_path"
 
 
 def test_manager_processed_marker_filtered() -> None:
-    print("test_manager_processed_marker_filtered")
     with _RootContext() as root:
         alice = root / "Users" / "Alice" / "Invoices" / "Approved"
         alice.mkdir(parents=True)
         (alice / "real.pdf").write_text("pdf")
         (alice / "Processed - marker.pdf").write_text("marker")
         result = _scan_manager_stuck()
-        _check("one_row", len(result.rows) == 1)
-        _check("real_present", result.rows[0]["fileName"] == "real.pdf")
+        assert len(result.rows) == 1, "one_row"
+        assert result.rows[0]["fileName"] == "real.pdf", "real_present"
 
 
 def test_manager_ap_only_user_ignored() -> None:
@@ -201,7 +176,6 @@ def test_manager_ap_only_user_ignored() -> None:
     but their on-disk shape differs. The manager scan must only surface
     folders with the manager-specific `Invoices/Approved/` subdir.
     """
-    print("test_manager_ap_only_user_ignored")
     with _RootContext() as root:
         sarah_paid = root / "Users" / "Sarah" / "Paid_Invoices"
         sarah_paid.mkdir(parents=True)
@@ -212,10 +186,10 @@ def test_manager_ap_only_user_ignored() -> None:
         (alice / "stuck.pdf").write_text("pdf")
 
         result = _scan_manager_stuck()
-        _check("only_one_row", len(result.rows) == 1)
-        _check("alice_only", result.rows[0]["managerName"] == "Alice")
-        _check("no_sarah", all(r["managerName"] != "Sarah" for r in result.rows))
-        _check("no_errors", result.errors == [])
+        assert len(result.rows) == 1, "only_one_row"
+        assert result.rows[0]["managerName"] == "Alice", "alice_only"
+        assert all(r["managerName"] != "Sarah" for r in result.rows), "no_sarah"
+        assert result.errors == [], "no_errors"
 
 
 def test_manager_disk_only_no_xls_row() -> None:
@@ -224,30 +198,23 @@ def test_manager_disk_only_no_xls_row() -> None:
     Strataplan snapshot is empty/inactive, the old `unique_managers(rows)`-
     based scan would silently miss disk residue. The new scan can't be
     fooled by snapshot state."""
-    print("test_manager_disk_only_no_xls_row")
     with _RootContext() as root:
-        # NO Strataplan_List.xlsx created in this test root. Yet:
         ghost = root / "Users" / "GhostManager" / "Invoices" / "Approved"
         ghost.mkdir(parents=True)
         (ghost / "left_behind.pdf").write_text("pdf")
         result = _scan_manager_stuck()
-        _check("ghost_surfaced", len(result.rows) == 1)
-        _check("ghost_name_from_disk", result.rows[0]["managerName"] == "GhostManager")
+        assert len(result.rows) == 1, "ghost_surfaced"
+        assert result.rows[0]["managerName"] == "GhostManager", "ghost_name_from_disk"
 
 
 def test_manager_users_iterdir_error() -> None:
     """A file at Users/ triggers iterdir error — same trick as intake."""
-    print("test_manager_users_iterdir_error")
     with _RootContext() as root:
         (root / "Users").write_text("oops, not a directory")
         result = _scan_manager_stuck()
-        _check("rows_empty", result.rows == [])
-        _check("one_error", len(result.errors) == 1)
-        _check(
-            "error_mentions_users",
-            "Users/" in result.errors[0],
-            f"got: {result.errors[0]!r}",
-        )
+        assert result.rows == [], "rows_empty"
+        assert len(result.errors) == 1, "one_error"
+        assert "Users/" in result.errors[0], f"error_mentions_users: got: {result.errors[0]!r}"
 
 
 def test_manager_per_folder_glob_error() -> None:
@@ -258,7 +225,6 @@ def test_manager_per_folder_glob_error() -> None:
     PermissionError on one manager would silently hide every other manager's
     stuck files in the morning report.
     """
-    print("test_manager_per_folder_glob_error")
     with _RootContext() as root:
         alice = root / "Users" / "Alice" / "Invoices" / "Approved"
         bob = root / "Users" / "Bob" / "Invoices" / "Approved"
@@ -277,34 +243,7 @@ def test_manager_per_folder_glob_error() -> None:
         with patch.object(Path, "glob", fail_for_alice):
             result = _scan_manager_stuck()
 
-        _check("one_error", len(result.errors) == 1, f"got: {result.errors}")
-        _check("error_mentions_alice", "Alice" in result.errors[0])
-        _check("alice_no_rows", all(r["managerName"] != "Alice" for r in result.rows))
-        _check("bob_still_scanned", any(r["managerName"] == "Bob" for r in result.rows))
-
-
-def main() -> int:
-    test_intake_missing_folder()
-    test_intake_empty_folder()
-    test_intake_mixed_contents()
-    test_intake_unicode_filename()
-    test_intake_iterdir_error()
-    test_manager_missing_users_dir()
-    test_manager_empty_users_dir()
-    test_manager_two_managers_stuck()
-    test_manager_processed_marker_filtered()
-    test_manager_ap_only_user_ignored()
-    test_manager_disk_only_no_xls_row()
-    test_manager_users_iterdir_error()
-    test_manager_per_folder_glob_error()
-    if FAILED:
-        print(f"\nFAILED ({len(FAILED)}):")
-        for n in FAILED:
-            print(f"  - {n}")
-        return 1
-    print("\nall ok")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+        assert len(result.errors) == 1, f"one_error: got: {result.errors}"
+        assert "Alice" in result.errors[0], "error_mentions_alice"
+        assert all(r["managerName"] != "Alice" for r in result.rows), "alice_no_rows"
+        assert any(r["managerName"] == "Bob" for r in result.rows), "bob_still_scanned"

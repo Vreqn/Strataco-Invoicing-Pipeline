@@ -7,9 +7,6 @@ Covers the new Action Required section that consolidates four sources:
   - Inbox emails (unhandled, from the live Graph query)
 
 Plus the legacy Processed / Duplicates sections (regression).
-
-Standalone: no pytest dependency. Run with `python tests/test_step6_summary_email.py`.
-Exits 0 if every case passes, 1 otherwise.
 """
 
 from __future__ import annotations
@@ -133,17 +130,6 @@ def _inbox_msg(
     }
 
 
-FAILED: list[str] = []
-
-
-def _check(name: str, cond: bool, detail: str = "") -> None:
-    if cond:
-        print(f"  ok   {name}")
-    else:
-        print(f"  FAIL {name}{(': ' + detail) if detail else ''}")
-        FAILED.append(name)
-
-
 def _build(
     *,
     today: str = "2026-05-12",
@@ -170,28 +156,20 @@ def _build(
 
 
 def test_all_empty() -> None:
-    print("test_all_empty")
     subject, body = _build()
 
-    _check(
-        "subject_format",
-        subject == "Invoices summary — 0 processed, 0 action required, 0 duplicate — 2026-05-12",
-        f"got: {subject!r}",
+    assert subject == "Invoices summary — 0 processed, 0 action required, 0 duplicate — 2026-05-12", (
+        f"subject_format: got: {subject!r}"
     )
-    _check("top_header", "Invoices summary — 2026-05-12" in body)
-    _check("processed_header", "== Processed (0) ==" in body)
-    _check("action_header", "== Action Required (0) ==" in body)
-    _check("duplicates_header", "== Duplicates (0) ==" in body)
-    _check(
-        "three_none_today_lines",
-        body.count("None today.") == 3,
-        f"body:\n{body}",
-    )
-    _check("no_subsection_header_leak", "-- Paid invoices stuck" not in body)
+    assert "Invoices summary — 2026-05-12" in body, "top_header"
+    assert "== Processed (0) ==" in body, "processed_header"
+    assert "== Action Required (0) ==" in body, "action_header"
+    assert "== Duplicates (0) ==" in body, "duplicates_header"
+    assert body.count("None today.") == 3, f"three_none_today_lines:\n{body}"
+    assert "-- Paid invoices stuck" not in body, "no_subsection_header_leak"
 
 
 def test_all_populated() -> None:
-    print("test_all_populated")
     processed = [
         _processed_row(),
         _processed_row(
@@ -224,98 +202,83 @@ def test_all_populated() -> None:
         duplicates=duplicates,
     )
 
-    _check(
-        "subject_counts",
-        subject == "Invoices summary — 2 processed, 4 action required, 1 duplicate — 2026-05-12",
-        f"got: {subject!r}",
+    assert subject == "Invoices summary — 2 processed, 4 action required, 1 duplicate — 2026-05-12", (
+        f"subject_counts: got: {subject!r}"
     )
-    _check("processed_header_count", "== Processed (2) ==" in body)
-    _check("action_header_count", "== Action Required (4) ==" in body)
-    _check("duplicates_header_count", "== Duplicates (1) ==" in body)
+    assert "== Processed (2) ==" in body, "processed_header_count"
+    assert "== Action Required (4) ==" in body, "action_header_count"
+    assert "== Duplicates (1) ==" in body, "duplicates_header_count"
 
-    _check("subhdr_paid_failed", "-- Paid invoices stuck (Step 6 couldn't archive) (1) --" in body)
-    _check(
-        "subhdr_manager_stuck",
-        "-- Manager approvals stuck (Step 5 didn't pick up) (1) --" in body,
+    assert "-- Paid invoices stuck (Step 6 couldn't archive) (1) --" in body, "subhdr_paid_failed"
+    assert "-- Manager approvals stuck (Step 5 didn't pick up) (1) --" in body, "subhdr_manager_stuck"
+    assert "-- Unmatched intake files (Steps 1/2/3 couldn't route) (1) --" in body, (
+        "subhdr_unmatched_intake"
     )
-    _check(
-        "subhdr_unmatched_intake",
-        "-- Unmatched intake files (Steps 1/2/3 couldn't route) (1) --" in body,
-    )
-    _check("subhdr_inbox", "-- Inbox emails (unhandled) (1) --" in body)
+    assert "-- Inbox emails (unhandled) (1) --" in body, "subhdr_inbox"
 
-    _check("paid_failed_row_filename", "Bad.pdf" in body)
-    _check("manager_stuck_manager_line", "Manager: Alice Manager" in body)
-    _check("unmatched_intake_filename", "scan_2026-05-12.pdf" in body)
-    _check("inbox_from_line", "From:    Vendor Inc <billing@vendor.example>" in body)
-    _check("inbox_msg_id", "Msg id:  AAMkAD-stuck-1" in body)
+    assert "Bad.pdf" in body, "paid_failed_row_filename"
+    assert "Manager: Alice Manager" in body, "manager_stuck_manager_line"
+    assert "scan_2026-05-12.pdf" in body, "unmatched_intake_filename"
+    assert "From:    Vendor Inc <billing@vendor.example>" in body, "inbox_from_line"
+    assert "Msg id:  AAMkAD-stuck-1" in body, "inbox_msg_id"
 
-    _check("no_none_today", "None today." not in body, "an empty-section sentinel leaked")
+    assert "None today." not in body, "no_none_today: an empty-section sentinel leaked"
 
 
 def test_only_processed_and_duplicates() -> None:
     """Action Required empty -> single 'None today.' under that section."""
-    print("test_only_processed_and_duplicates")
     subject, body = _build(
         processed=[_processed_row()],
         duplicates=[_fp_row()],
     )
-    _check(
-        "subject_partial",
-        subject == "Invoices summary — 1 processed, 0 action required, 1 duplicate — 2026-05-12",
-        f"got: {subject!r}",
+    assert subject == "Invoices summary — 1 processed, 0 action required, 1 duplicate — 2026-05-12", (
+        f"subject_partial: got: {subject!r}"
     )
-    _check("processed_header_1", "== Processed (1) ==" in body)
-    _check("action_header_0", "== Action Required (0) ==" in body)
-    _check("duplicates_header_1", "== Duplicates (1) ==" in body)
-    _check(
-        "single_none_today",
-        body.count("None today.") == 1,
-        f"expected 1, got {body.count('None today.')}",
+    assert "== Processed (1) ==" in body, "processed_header_1"
+    assert "== Action Required (0) ==" in body, "action_header_0"
+    assert "== Duplicates (1) ==" in body, "duplicates_header_1"
+    assert body.count("None today.") == 1, (
+        f"single_none_today: expected 1, got {body.count('None today.')}"
     )
-    _check("no_subsection_headers", "-- Paid invoices stuck" not in body)
+    assert "-- Paid invoices stuck" not in body, "no_subsection_headers"
 
 
 def test_paid_failed_minimal_fields() -> None:
     """When apName/localPath/mtimeIso aren't on a paid_failed row, those lines
     must not render. Guards conditional rendering for degraded rows."""
-    print("test_paid_failed_minimal_fields")
     _, body = _build(
         paid_failed=[_paid_failed_row(file_name="X.pdf", reason="no plan")],
     )
     paid_block = body.split("-- Paid invoices stuck")[1].split("==")[0]
-    _check("no_ap_line", "AP:" not in paid_block)
-    _check("no_path_line", "Path:" not in paid_block)
-    _check("no_stuck_since_line", "Stuck since:" not in paid_block)
-    _check("filename_present", "X.pdf" in body)
-    _check("reason_present", "Reason: no plan" in body)
+    assert "AP:" not in paid_block, "no_ap_line"
+    assert "Path:" not in paid_block, "no_path_line"
+    assert "Stuck since:" not in paid_block, "no_stuck_since_line"
+    assert "X.pdf" in body, "filename_present"
+    assert "Reason: no plan" in body, "reason_present"
 
 
 def test_only_manager_stuck() -> None:
-    print("test_only_manager_stuck")
     subject, body = _build(manager_stuck=[_manager_stuck_row()])
-    _check("subject_counts", "1 action required" in subject)
-    _check("action_header", "== Action Required (1) ==" in body)
-    _check("subhdr_only_manager", "-- Manager approvals stuck" in body)
-    _check("no_paid_subhdr", "-- Paid invoices stuck" not in body)
-    _check("no_unmatched_intake_subhdr", "-- Unmatched intake" not in body)
-    _check("no_inbox_subhdr", "-- Inbox emails" not in body)
-    _check("manager_line", "Manager: Alice Manager" in body)
-    _check("stuck_since_line", "Stuck since: 2026-05-11 16:22" in body)
+    assert "1 action required" in subject, "subject_counts"
+    assert "== Action Required (1) ==" in body, "action_header"
+    assert "-- Manager approvals stuck" in body, "subhdr_only_manager"
+    assert "-- Paid invoices stuck" not in body, "no_paid_subhdr"
+    assert "-- Unmatched intake" not in body, "no_unmatched_intake_subhdr"
+    assert "-- Inbox emails" not in body, "no_inbox_subhdr"
+    assert "Manager: Alice Manager" in body, "manager_line"
+    assert "Stuck since: 2026-05-11 16:22" in body, "stuck_since_line"
 
 
 def test_only_unmatched_intake() -> None:
-    print("test_only_unmatched_intake")
     _, body = _build(unmatched_intake=[_unmatched_intake_row()])
-    _check("subhdr", "-- Unmatched intake files (Steps 1/2/3 couldn't route) (1) --" in body)
+    assert "-- Unmatched intake files (Steps 1/2/3 couldn't route) (1) --" in body, "subhdr"
     intake_block = body.split("-- Unmatched intake")[1].split("==")[0]
-    _check("no_manager_line", "Manager:" not in intake_block)
-    _check("no_reason_line", "Reason:" not in intake_block)
-    _check("path_line", r"Path: D:\Strataco\_Unmatched\Invoices\scan_2026-05-12.pdf" in body)
+    assert "Manager:" not in intake_block, "no_manager_line"
+    assert "Reason:" not in intake_block, "no_reason_line"
+    assert r"Path: D:\Strataco\_Unmatched\Invoices\scan_2026-05-12.pdf" in body, "path_line"
 
 
 def test_only_inbox_messages() -> None:
-    print("test_only_inbox_messages")
     msgs = [
         _inbox_msg(),
         _inbox_msg(
@@ -326,129 +289,84 @@ def test_only_inbox_messages() -> None:
         ),
     ]
     subject, body = _build(inbox_messages=msgs)
-    _check("subject_2", "2 action required" in subject)
-    _check("subhdr_inbox", "-- Inbox emails (unhandled) (2) --" in body)
-    _check("numbered_1", "1. From:" in body)
-    _check("numbered_2", "2. From:" in body)
+    assert "2 action required" in subject, "subject_2"
+    assert "-- Inbox emails (unhandled) (2) --" in body, "subhdr_inbox"
+    assert "1. From:" in body, "numbered_1"
+    assert "2. From:" in body, "numbered_2"
 
 
 def test_inbox_error_renders_degraded() -> None:
     """When Graph fails, render the 'query failed' notice AND count it as +1 in
     the action total. Subject saying '0 action required' while the body asks
     the operator to open Outlook would be a lie — that was Codex's RISK 1."""
-    print("test_inbox_error_renders_degraded")
     subject, body = _build(
         inbox_error="HTTPError 503: service unavailable",
     )
-    _check(
-        "subject_one_action",
-        "1 action required" in subject,
-        f"inbox_error must increment action_count; got: {subject!r}",
+    assert "1 action required" in subject, (
+        f"subject_one_action: inbox_error must increment action_count; got: {subject!r}"
     )
-    _check("degraded_subhdr", "-- Inbox emails (unhandled) (query failed) --" in body)
-    _check("error_line", "Inbox query failed: HTTPError 503: service unavailable" in body)
-    _check("operator_hint", "open Outlook directly" in body)
-    _check(
-        "no_clean_none_today_under_action",
-        body.split("== Action Required")[1].split("==")[0].count("None today.") == 0,
-        "the inbox-error sub-section should suppress 'None today.' under Action Required",
+    assert "-- Inbox emails (unhandled) (query failed) --" in body, "degraded_subhdr"
+    assert "Inbox query failed: HTTPError 503: service unavailable" in body, "error_line"
+    assert "open Outlook directly" in body, "operator_hint"
+    action_section = body.split("== Action Required")[1].split("==")[0]
+    assert action_section.count("None today.") == 0, (
+        "no_clean_none_today_under_action: the inbox-error sub-section should suppress 'None today.'"
     )
 
 
 def test_inbox_error_with_other_action_items() -> None:
     """Action count includes other sources PLUS the inbox_error when Graph fails."""
-    print("test_inbox_error_with_other_action_items")
     subject, body = _build(
         manager_stuck=[_manager_stuck_row()],
         inbox_error="auth failed",
     )
-    _check(
-        "subject_two",
-        "2 action required" in subject,
-        f"1 stuck manager + 1 inbox_error = 2; got: {subject!r}",
+    assert "2 action required" in subject, (
+        f"subject_two: 1 stuck manager + 1 inbox_error = 2; got: {subject!r}"
     )
-    _check("manager_subhdr", "-- Manager approvals stuck" in body)
-    _check("inbox_degraded", "-- Inbox emails (unhandled) (query failed) --" in body)
+    assert "-- Manager approvals stuck" in body, "manager_subhdr"
+    assert "-- Inbox emails (unhandled) (query failed) --" in body, "inbox_degraded"
 
 
 def test_scan_errors_subsection_renders() -> None:
     """scan_errors populate a dedicated sub-section AND count toward action_count."""
-    print("test_scan_errors_subsection_renders")
     errs = [
         "_Unmatched/Invoices scan failed: PermissionError(13)",
         "manager Alice: PermissionError(13)",
     ]
     subject, body = _build(scan_errors=errs)
-    _check(
-        "subject_two_action",
-        "2 action required" in subject,
-        f"two scan errors should count as 2; got: {subject!r}",
+    assert "2 action required" in subject, (
+        f"subject_two_action: two scan errors should count as 2; got: {subject!r}"
     )
-    _check(
-        "scan_errors_subhdr",
-        "-- Pipeline scan errors (investigate folder permissions) (2) --" in body,
+    assert "-- Pipeline scan errors (investigate folder permissions) (2) --" in body, (
+        "scan_errors_subhdr"
     )
-    _check("first_error_rendered", "1. _Unmatched/Invoices scan failed" in body)
-    _check("second_error_rendered", "2. manager Alice" in body)
-    _check(
-        "no_none_today",
-        "None today." not in body.split("== Action Required")[1].split("==")[0],
-    )
+    assert "1. _Unmatched/Invoices scan failed" in body, "first_error_rendered"
+    assert "2. manager Alice" in body, "second_error_rendered"
+    action_block = body.split("== Action Required")[1].split("==")[0]
+    assert "None today." not in action_block, "no_none_today"
 
 
 def test_scan_errors_with_other_action_items() -> None:
     """scan_errors integrate with other Action Required sources cleanly."""
-    print("test_scan_errors_with_other_action_items")
     subject, body = _build(
         manager_stuck=[_manager_stuck_row()],
         scan_errors=["_Unmatched/Invoices scan failed: PermissionError"],
     )
-    _check(
-        "subject_two_action",
-        "2 action required" in subject,
-        f"1 manager + 1 scan error = 2; got: {subject!r}",
+    assert "2 action required" in subject, (
+        f"subject_two_action: 1 manager + 1 scan error = 2; got: {subject!r}"
     )
-    _check("manager_subhdr", "-- Manager approvals stuck" in body)
-    _check("scan_errors_subhdr", "-- Pipeline scan errors" in body)
+    assert "-- Manager approvals stuck" in body, "manager_subhdr"
+    assert "-- Pipeline scan errors" in body, "scan_errors_subhdr"
 
 
 def test_clean_day_renders_single_none_today() -> None:
     """Explicit assertion that with empty scan_errors and clean Inbox, exactly
     one 'None today.' appears under Action Required (and the others stay where
     they were before — under Processed and Duplicates)."""
-    print("test_clean_day_renders_single_none_today")
-    subject, body = _build()  # all empty, no errors
-    _check("zero_action", "0 action required" in subject)
+    subject, body = _build()
+    assert "0 action required" in subject, "zero_action"
     action_block = body.split("== Action Required")[1].split("== Duplicates")[0]
-    _check(
-        "exactly_one_none_today_in_action_block",
-        action_block.count("None today.") == 1,
-        f"got: {action_block.count('None today.')}",
+    assert action_block.count("None today.") == 1, (
+        f"exactly_one_none_today_in_action_block: got: {action_block.count('None today.')}"
     )
-    _check("three_none_today_total", body.count("None today.") == 3)
-
-
-def main() -> int:
-    test_all_empty()
-    test_all_populated()
-    test_only_processed_and_duplicates()
-    test_paid_failed_minimal_fields()
-    test_only_manager_stuck()
-    test_only_unmatched_intake()
-    test_only_inbox_messages()
-    test_inbox_error_renders_degraded()
-    test_inbox_error_with_other_action_items()
-    test_scan_errors_subsection_renders()
-    test_scan_errors_with_other_action_items()
-    test_clean_day_renders_single_none_today()
-    if FAILED:
-        print(f"\nFAILED ({len(FAILED)}):")
-        for n in FAILED:
-            print(f"  - {n}")
-        return 1
-    print("\nall ok")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    assert body.count("None today.") == 3, "three_none_today_total"

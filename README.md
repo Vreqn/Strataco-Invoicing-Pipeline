@@ -10,12 +10,12 @@ Six daily scheduled jobs move invoices through their lifecycle every weekday, an
 
 | Time  | Step | Purpose |
 |-------|------|---------|
-| 06:00 | 1 — intake          | Pull invoice attachments out of the inbox; identify the Strata Plan from email subject, body, or PDF text; stamp with a red Received stamp and route to the right manager's `To_Approve` folder. Unidentified emails stay in Inbox for the operator to handle (see "Recovery workflow" below). |
+| 06:00 | 1 — intake          | Pull invoice attachments out of the inbox; identify the Strata Plan from email subject, body, or PDF text; stamp with a red Received stamp and route to the right manager's `To_Approve` folder. Unidentified emails stay in Inbox for the front desk to handle (see "Recovery workflow" below). |
 | 06:10 | 2 — unzip           | Open any ZIPs in `_Unmatched/Invoices` so Step 3 can sort the contents. |
 | 06:20 | 3 — pdf_sort        | Identify the Strata Plan from PDFs left in `_Unmatched/Invoices` (primarily PDFs that came out of Step 2's ZIP extraction; single-PDF emails are already handled in Step 1). |
 | 06:30 | 4 — pending_email   | Email each manager a daily summary of what's waiting in their `To_Approve` folder. |
 | 06:40 | 5 — to_ap           | Move manager-approved invoices into the AP's `Approved_Invoices` folder, applying a blue Paid stamp the accountant fills in. |
-| 07:00 | 6 — paid_archive    | After the accountant flattens the PDF with Date + Check Number filled in, archive it under `Strata_Plans/<plan>/<check_number> - <name>.pdf`. Then scans the pipeline for stuck files, queries the Inbox for unhandled emails, and sends the daily "Invoices summary" email — the operator's single morning surface for everything that needs attention. |
+| 07:00 | 6 — paid_archive    | After the accountant fills in Date + Check Number and saves, archive it under `Strata_Plans/<plan>/<check_number> - <name>.pdf` — Step 6 handles the flatten. Then scans the pipeline for stuck files, queries the Inbox for unhandled emails, and sends the daily "Invoices summary" email — the front desk's single morning surface for everything that needs attention. |
 | monthly | 7 — aggregate     | For each plan, merge the previous month's archived invoices into one combined `Summary - <MM> - <plan> <Month> <YYYY> inv.pdf` and move the sources into `Strata_Plans/<plan>/Processed/<YYYY-MM>/`. Operator picks the day in Task Scheduler (typically 5th–10th of the new month). |
 
 Every step writes one row to `logs/daily_summary.csv` (columns: `date`, `step`, `processed`, `need_review`, `errors`, `duration_sec`, `status` — `need_review` covers emails Step 1 deliberately left in the Inbox for operator action, distinct from `errors` which counts genuine exceptions) and a detailed log to `logs/step_N_<date>.log`. Step 7 additionally appends one row per (plan, month) to `_state/monthly_aggregations.csv` as an audit ledger.
@@ -30,7 +30,7 @@ Every step writes one row to `logs/daily_summary.csv` (columns: `date`, `step`, 
 
 Step 1 tries three matchers in order: email subject, email body, then PDF text content. If all three fail, the email **stays in the Inbox** (it is not moved to `processed_emails`). No file is written to `_Unmatched/` for these — the email itself is the recovery surface.
 
-When the operator sees an unhandled email in the Inbox, the recovery action is:
+When the front desk sees an unhandled email in the Inbox, the recovery action is:
 
 1. Hit **Reply** on the email.
 2. Change the To: field from the vendor's address to `testinvsml@stratacomgmt.com`.
@@ -39,9 +39,9 @@ When the operator sees an unhandled email in the Inbox, the recovery action is:
 
 Next morning's 06:00 pass will see the reply, match the subject, look up the conversation thread via Microsoft Graph, find the original message, pull the PDF, stamp it, route it, and move **both** the reply and the original to `processed_emails`. Nothing left to clean up.
 
-**The Reply gotcha.** The To: field auto-fills with the vendor's address. If the operator forgets to change it, the reply goes to the vendor with `BCS 2707` in the subject — harmless, just embarrassing. Re-send to the right address and try again.
+**The Reply gotcha.** The To: field auto-fills with the vendor's address. If the front desk forgets to change it, the reply goes to the vendor with `BCS 2707` in the subject — harmless, just embarrassing. Re-send to the right address and try again.
 
-**Optional polish — Outlook Quick Step.** In Outlook desktop, a one-time IT setup adds a "Tag for Automation" button to the Home ribbon. Clicking it opens a Reply compose window with To: already filled in to `testinvsml@stratacomgmt.com`, so the gotcha is eliminated. The normal Reply button is unaffected. Not available in OWA; skip if the operator is browser-only.
+**Optional polish — Outlook Quick Step.** In Outlook desktop, a one-time IT setup adds a "Tag for Automation" button to the Home ribbon. Clicking it opens a Reply compose window with To: already filled in to `testinvsml@stratacomgmt.com`, so the gotcha is eliminated. The normal Reply button is unaffected. Not available in OWA; skip if the front desk is browser-only.
 
 To set this up in Outlook desktop:
 
@@ -71,7 +71,7 @@ Strataco Invoicing/
 ├── steps/              ← THE 7 STEP SCRIPTS (six daily + one monthly Task Scheduler job)
 ├── workflows/          ← markdown SOPs, one per step
 ├── tools/_lib/         ← shared library imported by every step
-├── tests/              ← regression tests (run with `python tests/<file>.py`, no pytest needed)
+├── tests/              ← regression tests (run with `pytest tests/`)
 ├── reference/          ← read-only originals: N8n .json, docs, stamp samples
 ├── To-Speak-About.txt  ← deferred policy/workflow questions for client discussion
 └── logs/               ← daily_summary.csv, per-step .log, lockfiles
@@ -113,12 +113,12 @@ This is the source of `TENANT_ID`, `CLIENT_ID`, and `CLIENT_SECRET` in `.env`. W
 
 You'll also need one-time OWA access to the mailbox to create the two Inbox subfolders described in "One-time setup" step 4.
 
-### B. User workstations (managers, accountants, front-desk operator)
+### B. User workstations (managers, accountants, front desk)
 
 These users **never** touch the N8N server. Each one has the real Strataco file server mapped as a network drive and does their daily work in those folders. Nothing pipeline-specific gets installed on these machines — everything they need is already standard Strataco software:
 
-- **Adobe Acrobat** — every accountant workstation has this. Required for Step 5's Paid-stamp fill-and-flatten step (type Date + Check Number into the blue Paid stamp's fields, then **File → Export as PDF** to bake the values in as plain text). Adobe Reader alone is not sufficient — flattening is the load-bearing step that lets Step 6 read the values back.
-- **Outlook** (desktop or web) — every user has this. The front-desk operator additionally needs shared-inbox access to `testinvsml@stratacomgmt.com`.
+- **Adobe Acrobat** — every accountant workstation has this. Required for the AP to type Date + Check Number into the blue Paid stamp's fields and Ctrl+S the PDF. Flattening is handled by Step 6 — the AP does not need to Print-to-PDF or Export-as-PDF.
+- **Outlook** (desktop or web) — every user has this. The front desk additionally needs shared-inbox access to `testinvsml@stratacomgmt.com`.
 - **File Explorer** — the only "tool" managers need to drag invoices between `To_Approve` and `Approved`.
 
 No Python, no scripts, no logs on these machines. The only humans technical enough to run code or read logs are the two system administrators (Krisztian + his dad).
@@ -281,6 +281,59 @@ See [workflows/duplicate_detection.md](workflows/duplicate_detection.md) for the
 
 ---
 
+## Keeping the deploy machine in sync with GitHub
+
+The repo lives at <https://github.com/Vreqn/Strataco-Invoicing-Pipeline>. When changes have been pushed to GitHub from another machine, pull them down onto the N8N server (the deploy machine) before the next cron run. This is a sysadmin task — managers, accountants, and the front desk never touch git.
+
+### The standard pull workflow
+
+From PowerShell in the project root:
+
+```powershell
+cd "Q:\AI Automation\Strataco Invoicing"
+git status                  # confirm the working tree is clean
+git pull                    # fetches and fast-forwards from origin/main
+```
+
+`git status` should report `nothing to commit, working tree clean` before you pull. If it shows local modifications, decide what to do with them before pulling:
+
+- **Real local work** (e.g. you edited a workflow doc on the deploy machine and forgot to commit): commit it first, then pull. The pull will merge or fast-forward cleanly.
+- **Accidental edits or testing leftovers**: discard them with `git restore <file>` (or `git checkout -- <file>` on older Git) before pulling.
+- **`.env`, anything under `logs/`, anything under `_state/`, anything under `.tmp/`**: these should never show as modified at all — they're listed in `.gitignore`. If one does show up, that means the gitignore is out of date or something escaped it. Don't commit it; ask Krisztian.
+
+### After a pull
+
+Run through this short checklist:
+
+1. **If `requirements.txt` changed**, re-install dependencies before the next cron fires:
+   ```powershell
+   python -m pip install -r requirements.txt
+   ```
+2. **If `VERSION` bumped or `ReleaseNotes.txt` got new entries**, skim them so you know what changed. The release notes always explain why something moved and what to expect at runtime.
+3. **If any step's script changed**, run a fast sanity check by invoking the cheapest step manually:
+   ```powershell
+   python steps/step_2_unzip.py
+   ```
+   You should see `step_2 started` → `step_2 finished` in the console with a fresh row appended to `logs/daily_summary.csv`. If it errors out, fix it before the next 06:00 cron run rather than letting six steps fail in sequence.
+4. **If any `workflows/*.md` changed**, share the diff with whoever maintains the operator training brief.
+
+### When a pull refuses to fast-forward
+
+If `git pull` says something like `Your local changes to the following files would be overwritten by merge`, your local tree has edits that conflict with what's coming down from GitHub. The two safe paths:
+
+- **Keep the local edits**: `git stash`, then `git pull`, then `git stash pop` and resolve any conflicts.
+- **Throw the local edits away** (if you know they were accidental): `git restore <file>` for each one, then `git pull` again.
+
+Never use `git reset --hard` or `git checkout -- .` unless you've verified there's nothing worth keeping. Those commands silently delete uncommitted work.
+
+### Authentication
+
+The remote uses HTTPS, and Git Credential Manager (bundled with Git for Windows) handles the GitHub login on first use. If you ever get prompted to re-authenticate, a browser tab opens, you sign into GitHub once, and the credential is cached. No Personal Access Token setup needed.
+
+If a future SSH-key migration ever happens, this section needs updating — but for now HTTPS + Credential Manager is the documented path.
+
+---
+
 ## Troubleshooting
 
 **"Missing required environment variable: STRATACO_ROOT"**
@@ -309,17 +362,17 @@ Then the next time that PDF arrives through Step 1/3/5, it routes normally. The 
 → The automation couldn't identify a Strata Plan from the subject, body, or PDF text. Use the recovery workflow above: hit Reply, change To: to `testinvsml@stratacomgmt.com`, edit the subject to include the strata number, Send. Next 06:00 pass routes the original PDF via conversation-link. If the plan isn't recognized at all, check that it's in `Strataplan_List.xlsx`.
 
 **A PDF keeps ending up in `_Unmatched/Invoices`**
-→ A PDF (or a ZIP that Step 2 extracted into a PDF) made it to the sorting yard but Step 3 couldn't identify a Strata Plan from the filename or PDF text. Either the plan isn't parseable from those sources, or the plan isn't in `Strataplan_List.xlsx`. Rename the file with the right plan prefix and move it to the manager's `To_Approve` folder, or add the row to the XLS.
+→ A PDF (or a ZIP that Step 2 extracted into a PDF) made it to the sorting yard but Step 3 couldn't identify a Strata Plan from the filename or PDF text. Either the plan isn't parseable from those sources, or the plan isn't in `Strataplan_List.xlsx`. **Do not drop the PDF into a manager folder by hand** — the Received stamp is only applied during Step 1, and a manual drop silently breaks Step 5/6. Instead: either add the plan to the XLS and let the next Step 3 run pick it up, OR rename the PDF to put the plan code somewhere parseable and let the next Step 3 run sort it, OR forward the PDF to `testinvsml@stratacomgmt.com` as an email with the plan code in the subject so Step 1 stamps it cleanly.
 
 (As of 0.11.2, non-PDF/non-ZIP attachments — signature images, `.docx`, `.xlsx` — are **discarded at intake** in Step 1 with an INFO log line and never reach `_Unmatched/`. If a real invoice arrives as a Word doc, the vendor needs to resend as PDF.)
 
-(Unmatched single-PDF or multi-PDF emails without identifying info DO NOT land here — they stay in the Inbox for the operator's reply-to-self recovery.)
+(Unmatched single-PDF or multi-PDF emails without identifying info DO NOT land here — they stay in the Inbox for the front desk's reply-to-self recovery.)
 
 **Stamp covers important text on the invoice**
 → See "Tunable constants" — increase `WHITE_PCT_MIN`. The algorithm picks the largest qualifying whitespace area; a higher threshold rejects sparsely-populated regions.
 
 **Step 6 says "Could not read Check Number"**
-→ Open the PDF in Acrobat. The Date and Check Number fields must be **flattened** (not editable form fields) — re-save with "Print → Save as PDF" so the values become regular text.
+→ Open the PDF in Acrobat. The Date and Check Number fields are probably blank. Fill them in, Ctrl+S to save in place, and the next Step 6 run will pick it up. Step 6 reads the AcroForm values directly and flattens automatically — do NOT Print-to-PDF.
 
 **A step shows `status=skipped` in `daily_summary.csv`**
 → The previous run of the same step was still active when the next cron fired. Check `logs/step_N_<date>.log` for what's making it slow. Stale lockfiles can be removed manually: `del logs\.step_N.lock`.

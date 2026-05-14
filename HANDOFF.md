@@ -14,7 +14,7 @@ The full design is captured here (in priority order):
 3. `tools/_lib/*.py` — the actual implementation.
 4. `reference/` — original N8n exports and stamp samples for reference only.
 5. `To-Speak-About.txt` — deferred policy/workflow questions awaiting client discussion (do not implement these unilaterally; see CLAUDE.md for the convention).
-6. `tests/` — regression test suite; run with `python tests/<test_file>.py` (no pytest needed).
+6. `tests/` — regression test suite; run with `pytest tests/` (CLAUDE.md is the source of truth on test conventions).
 
 Skip `ReleaseNotes.txt` unless you're investigating regressions; it's history, not state.
 

@@ -47,6 +47,7 @@ from tools._lib import (
     plan_match,
     safe_io,
     strataplan_snapshot,
+    zip_safe,
 )
 from tools._lib.log import daily_log
 from tools._lib.pdf_text import extract_full_text
@@ -993,9 +994,12 @@ def _process_self_attachments(
     # Pass 1: split into PDFs, ZIPs, and discards. Email signature decorations
     # (image001.png, Outlook-*.png, ServiceBox-Navy.png, etc.) and one-off
     # office files (.docx, .xlsx) are discarded here — not downloaded, not
-    # saved to _Unmatched. The audit trail is the INFO log line. ZIPs are
-    # preserved and saved to _Unmatched/Invoices on the happy path so Step 2
-    # can unpack them.
+    # saved to _Unmatched. The audit trail is the INFO log line.
+    #
+    # ZIPs are inspected in memory in Pass 2b: their contained PDFs become
+    # full participants in the email-level decision. ZIPs themselves are
+    # never written to disk by Step 1 — see the resolved 2026-05-13 ZIP-
+    # orphan entry in `To-Speak-About.txt`.
     pdf_atts: list[tuple[dict, str]] = []   # (att, base_name)
     zip_atts: list[tuple[dict, str]] = []   # (att, base_name)
     for a in kept:
@@ -1012,11 +1016,13 @@ def _process_self_attachments(
             ct = str(a.get("contentType") or "").strip() or "unknown"
             run.info(f"discarded non-PDF/ZIP attachment: '{base_name}' ({ct})")
 
-    # Pass 2: download + classify every PDF. Any download failure flags the
-    # whole email — we can't make a safe routing decision without seeing the bytes.
+    # Pass 2a: download + classify every top-level PDF. Any download failure
+    # flags the whole email — we can't make a safe routing decision without
+    # seeing the bytes.
     classifications: list[PdfClassification] = []
     download_failures: list[str] = []
     invalid_pdfs: list[str] = []  # bytes don't start with %PDF- (imposter file)
+    unsafe_zips: list[str] = []   # ZIPs that failed the audit (bomb / encrypted / non-PDF entries)
     for a, base_name in pdf_atts:
         try:
             blob = graph.download_attachment(msg_id, str(a.get("id")))
@@ -1030,6 +1036,47 @@ def _process_self_attachments(
         cls = _classify_pdf_against_subject(blob, base_name, plan_row.plan_norm, rows)
         classifications.append(cls)
 
+    # Pass 2b: download + audit each ZIP in memory, then classify each
+    # contained PDF the same way top-level PDFs are classified above. The
+    # strict zip_safe.audit_and_extract_pdfs rejects any non-PDF entry,
+    # any bomb, and any encrypted ZIP — those become unsafe_zips, which
+    # flag the email and force it to stay in the Inbox.
+    for a, base_name in zip_atts:
+        try:
+            zip_blob = graph.download_attachment(msg_id, str(a.get("id")))
+        except Exception as exc:
+            run.error(f"download failed for '{subject[:50]}'/{base_name}: {exc}")
+            download_failures.append(base_name)
+            continue
+        try:
+            inner = zip_safe.audit_and_extract_pdfs(zip_blob)
+        except zip_safe.UnsafeZipError as exc:
+            run.error(
+                f"unsafe zip in '{subject[:50]}'/{base_name}: {exc} — "
+                f"flagging email, nothing written to disk"
+            )
+            unsafe_zips.append(f"{base_name} ({exc})")
+            continue
+        if not inner:
+            run.info(f"zip '{base_name}' contained no PDF entries — ignored")
+            continue
+        zip_stem = Path(base_name).stem
+        for inner_leaf, inner_bytes in inner:
+            inner_base_name = f"{zip_stem}__{inner_leaf}"
+            if not _is_real_pdf(inner_bytes):
+                invalid_pdfs.append(inner_base_name)
+                continue
+            # Classify using inner_leaf ONLY so the ZIP filename's plan
+            # tokens can't influence the filename-fallback matcher. Then
+            # rebrand the classification's base_name with the
+            # `<zipbase>__<inner>` prefix so the routed file + audit log
+            # still trace back to the source ZIP. (Codex review 2026-05-13.)
+            cls = _classify_pdf_against_subject(
+                inner_bytes, inner_leaf, plan_row.plan_norm, rows,
+            )
+            cls.base_name = inner_base_name
+            classifications.append(cls)
+
     if download_failures:
         run.error(
             f"flagging '{subject[:60]}': download failed for "
@@ -1042,6 +1089,14 @@ def _process_self_attachments(
         run.review(
             f"flagging '{subject[:60]}': invalid PDF bytes (not real PDFs "
             f"despite .pdf names): {', '.join(invalid_pdfs)}"
+        )
+        _flag_message_safely(msg_id, subject, run)
+        return
+
+    if unsafe_zips:
+        run.review(
+            f"flagging '{subject[:60]}': unsafe ZIP attachment(s): "
+            f"{', '.join(unsafe_zips)}"
         )
         _flag_message_safely(msg_id, subject, run)
         return
@@ -1084,40 +1139,18 @@ def _process_self_attachments(
         elif outcome == RouteOutcome.DUPLICATE_SKIPPED:
             run.processed += 1
 
-    # ZIPs go to _Unmatched/Invoices/ for Step 2 to unpack. Same write semantics
-    # as the old non-PDF save path, but scoped to ZIPs only — non-PDF/non-ZIP
-    # attachments are discarded in Pass 1.
-    for a, base_name in zip_atts:
-        try:
-            blob = graph.download_attachment(msg_id, str(a.get("id")))
-        except Exception as exc:
-            run.error(f"download failed for '{subject[:50]}'/{base_name}: {exc}")
-            outcomes.append(RouteOutcome.FAILED)
-            continue
-        out_name = safe_io.sanitize_filename(base_name)
-        dest_path = paths.unmatched_invoices() / out_name
-        try:
-            written = safe_io.safe_write_unique(dest_path, blob)
-            run.processed += 1
-            outcomes.append(RouteOutcome.ROUTED)
-            if written != dest_path:
-                run.info(
-                    f"saved zip to _Unmatched (for Step 2): {written} "
-                    f"(collision-renamed from {dest_path.name})"
-                )
-            else:
-                run.info(f"saved zip to _Unmatched (for Step 2): {written}")
-        except Exception as exc:
-            run.error(f"write failed for {dest_path}: {exc}")
-            outcomes.append(RouteOutcome.FAILED)
+    # ZIPs were inspected in Pass 2b — their contained PDFs are already in
+    # `classifications` and routed by the loop above. ZIPs themselves are
+    # never written to disk by Step 1; their useful payload is already in
+    # the right manager folders.
 
     # Partial-commit guard: if *any* attachment failed after others succeeded,
     # the email otherwise looks like an ordinary unrouted message in the Inbox
     # (because `_email_destination` returns None on any FAILED). Set the
     # Outlook to-do flag so the operator notices that some content already
-    # committed downstream and needs reconciliation. `_route_pdf`/_Unmatched
-    # writes that already succeeded cannot be rolled back; the loud log + red
-    # flag are the operator-facing signal.
+    # committed downstream and needs reconciliation. `_route_pdf` writes that
+    # already succeeded cannot be rolled back; the loud log + red flag are
+    # the operator-facing signal.
     if any(o == RouteOutcome.FAILED for o in outcomes):
         succeeded = sum(
             1 for o in outcomes
@@ -1289,17 +1322,21 @@ def _process_pdf_text_fallback(
     """Subject/body didn't match — try to identify the plan from PDF text.
 
     All-or-nothing rule (with duplicate-aware extension):
-      - Every PDF in the email must be auto-handleable: either matched-and-new
-        (will route) or matched-and-duplicate (will skip via ledger).
-      - If ANY PDF doesn't match, OR there's any non-PDF/ZIP attachment
-        the matcher can't handle, leave the entire email in the Inbox.
-        Do NOT write anything to disk. **Do NOT increment dup_count** —
-        we haven't committed to processing this email yet.
+      - Every PDF in the email — top-level OR extracted from a ZIP — must be
+        auto-handleable: either matched-and-new (will route) or matched-and-
+        duplicate (will skip via ledger).
+      - If ANY PDF doesn't match, OR a ZIP fails the safety audit (non-PDF
+        entries, bomb, encrypted), OR any download fails, OR any .pdf bytes
+        aren't a real PDF, leave the entire email in the Inbox with the
+        Outlook red flag. Do NOT write anything to disk. **Do NOT increment
+        dup_count** — we haven't committed to processing this email yet.
 
     Honors the "Inbox is the single source of truth" principle: we never
     silently leave anything in _Unmatched/ that the operator wouldn't
-    notice. A known duplicate is treated as auto-handleable (the system
-    knows what to do with it: skip and increment the counter).
+    notice. ZIPs are inspected in memory (zip_safe.audit_and_extract_pdfs)
+    and their contained PDFs are full participants in the all-or-nothing
+    decision — there is no longer a ZIP exemption. See the resolved
+    2026-05-13 ZIP-orphan entry in `To-Speak-About.txt`.
     """
     try:
         attachments = graph.list_attachments(msg_id)
@@ -1313,46 +1350,41 @@ def _process_pdf_text_fallback(
         return
 
     # Pass 1: classify each attachment WITHOUT writing anything to disk or
-    # mutating the ledger. PDFs are downloaded in memory and tested for plan
-    # match + duplicate status. ZIPs are deferred — saved to _Unmatched/Invoices/
-    # for Step 2 to unpack, and they do NOT trigger the all-or-nothing rule
-    # (Step 2 + Step 3 will handle their contents downstream). Signature images
-    # and one-off office files (.docx, .xlsx) are discarded with an INFO log.
+    # mutating the ledger. Top-level PDFs are downloaded in memory and tested
+    # for plan match + duplicate status. ZIPs are downloaded, audited
+    # (zip_safe.audit_and_extract_pdfs), and each contained PDF is classified
+    # the same way — its synthetic base_name is `<zipbase>__<inner>.pdf` so
+    # the audit trail shows where it came from. Signature images and one-off
+    # office files (.docx, .xlsx) are discarded with an INFO log.
     pdf_outcomes: list[dict] = []  # {blob, base_name, plan_row|None, dup_existing|None, note}
-    zip_atts: list[tuple[dict, str]] = []  # (att, base_name) — saved to _Unmatched on the happy path
+    zip_atts: list[tuple[dict, str]] = []  # (att, base_name) — inspected in Pass 1, never written to disk
     download_failures: list[str] = []
-    invalid_pdfs: list[str] = []  # bytes don't start with %PDF- (imposter file)
+    invalid_pdfs: list[str] = []   # bytes don't start with %PDF- (imposter file)
+    unsafe_zips: list[str] = []    # ZIPs that failed zip_safe.audit_and_extract_pdfs
 
-    for a in kept:
-        ext = _ext_for_attachment(a, subject)
-        base_name = str(a.get("name") or "file").strip() or "file"
-        if not re.search(r"\.[A-Za-z0-9]{1,8}$", base_name):
-            base_name = f"{base_name}{ext}"
-        is_invoice_container = _looks_like_pdf_or_zip(a, subject)
-        if ext == ".zip" and is_invoice_container:
-            zip_atts.append((a, base_name))
-            continue
-        if ext != ".pdf" or not is_invoice_container:
-            ct = str(a.get("contentType") or "").strip() or "unknown"
-            run.info(f"discarded non-PDF/ZIP attachment: '{base_name}' ({ct})")
-            continue
+    def _classify_one(
+        blob: bytes,
+        classification_name: str,
+        route_name: str | None = None,
+    ) -> None:
+        """Plan-match (PDF text first, filename fallback) + dup lookup; append
+        to `pdf_outcomes`. Encapsulated so top-level PDFs and ZIP-contained
+        PDFs go through the exact same logic.
 
-        try:
-            blob = graph.download_attachment(msg_id, str(a.get("id")))
-        except Exception as exc:
-            run.error(f"download failed for '{subject[:50]}'/{base_name}: {exc}")
-            download_failures.append(base_name)
-            continue
-
-        if not _is_real_pdf(blob):
-            invalid_pdfs.append(base_name)
-            continue
-
+        `classification_name` is what the filename-fallback matcher sees:
+        the inner leaf for ZIP-contained PDFs, so the ZIP filename's plan
+        tokens cannot influence routing (Codex review 2026-05-13).
+        `route_name` is what gets stored in `pdf_outcomes` and used for
+        the routed filename / audit trail; for ZIP-contained PDFs it's
+        the `<zipbase>__<inner>` prefixed form. Defaults to
+        `classification_name` for top-level PDFs.
+        """
+        if route_name is None:
+            route_name = classification_name
         # PDF text is primary evidence; filename is a fallback when text doesn't
         # yield a confident match. This is the safer order — a vendor who
         # mislabels a file (filename says EPS6008, contents say BCS3396) gets
         # caught by the body content rather than blindly routed by filename.
-        # Costs one text extraction per PDF, which we accept.
         text = extract_full_text(blob)
         result = plan_match.match_from_pdf_text(text, rows)
         plan_row = result.plan_row if (
@@ -1361,7 +1393,9 @@ def _process_pdf_text_fallback(
         if plan_row is not None:
             result_note = result.note or "matched by PDF text"
         else:
-            fn_row = plan_match.match_from_filename_with_base_fallback(base_name, rows)
+            fn_row = plan_match.match_from_filename_with_base_fallback(
+                classification_name, rows,
+            )
             if fn_row is not None and fn_row.manager_name:
                 plan_row = fn_row
                 result_note = (
@@ -1387,26 +1421,85 @@ def _process_pdf_text_fallback(
 
         pdf_outcomes.append({
             "blob": blob,
-            "base_name": base_name,
+            "base_name": route_name,
             "plan_row": plan_row,
             "dup_existing": dup_existing,
             "note": note,
         })
 
+    for a in kept:
+        ext = _ext_for_attachment(a, subject)
+        base_name = str(a.get("name") or "file").strip() or "file"
+        if not re.search(r"\.[A-Za-z0-9]{1,8}$", base_name):
+            base_name = f"{base_name}{ext}"
+        is_invoice_container = _looks_like_pdf_or_zip(a, subject)
+
+        if ext == ".zip" and is_invoice_container:
+            zip_atts.append((a, base_name))
+            try:
+                zip_blob = graph.download_attachment(msg_id, str(a.get("id")))
+            except Exception as exc:
+                run.error(f"download failed for '{subject[:50]}'/{base_name}: {exc}")
+                download_failures.append(base_name)
+                continue
+            try:
+                inner = zip_safe.audit_and_extract_pdfs(zip_blob)
+            except zip_safe.UnsafeZipError as exc:
+                run.error(
+                    f"unsafe zip in '{subject[:50]}'/{base_name}: {exc} — "
+                    f"flagging email, nothing written to disk"
+                )
+                unsafe_zips.append(f"{base_name} ({exc})")
+                continue
+            if not inner:
+                run.info(f"zip '{base_name}' contained no PDF entries — ignored")
+                continue
+            zip_stem = Path(base_name).stem
+            for inner_leaf, inner_bytes in inner:
+                inner_base_name = f"{zip_stem}__{inner_leaf}"
+                if not _is_real_pdf(inner_bytes):
+                    invalid_pdfs.append(inner_base_name)
+                    continue
+                # `inner_leaf` for classification (ZIP filename's plan
+                # tokens must NOT influence the matcher); `inner_base_name`
+                # for routing/audit trail. (Codex review 2026-05-13.)
+                _classify_one(inner_bytes, inner_leaf, inner_base_name)
+            continue
+
+        if ext != ".pdf" or not is_invoice_container:
+            ct = str(a.get("contentType") or "").strip() or "unknown"
+            run.info(f"discarded non-PDF/ZIP attachment: '{base_name}' ({ct})")
+            continue
+
+        try:
+            blob = graph.download_attachment(msg_id, str(a.get("id")))
+        except Exception as exc:
+            run.error(f"download failed for '{subject[:50]}'/{base_name}: {exc}")
+            download_failures.append(base_name)
+            continue
+
+        if not _is_real_pdf(blob):
+            invalid_pdfs.append(base_name)
+            continue
+
+        _classify_one(blob, base_name)
+
     # Pass 2: decide whether the email is auto-handleable.
-    # ZIPs are always auto-handleable (Step 2 unpacks them downstream), so they
-    # don't gate the decision. Unmatched PDFs, download failures, and invalid
-    # PDF bytes (imposter files) all gate it.
+    # ZIP-contained PDFs are already in `pdf_outcomes`; ZIPs themselves no
+    # longer participate as separate entities. Unmatched PDFs, download
+    # failures, invalid PDF bytes, and unsafe ZIPs all gate the decision.
     any_unmatched_pdf = any(o["plan_row"] is None for o in pdf_outcomes)
     has_download_failure = bool(download_failures)
     has_invalid_pdfs = bool(invalid_pdfs)
-    has_actionable_content = bool(pdf_outcomes) or bool(zip_atts)
+    has_unsafe_zips = bool(unsafe_zips)
+    has_actionable_content = bool(pdf_outcomes)
 
     can_route_all = (
         has_actionable_content
         and not any_unmatched_pdf
         and not has_download_failure
         and not has_invalid_pdfs
+        and not has_unsafe_zips
     )
 
     if not can_route_all:
@@ -1425,25 +1518,37 @@ def _process_pdf_text_fallback(
             f"{o['base_name']} [{o['note']}]"
             for o in pdf_outcomes if o["plan_row"] is None
         ]
-        zip_names = [bn for _, bn in zip_atts]
         parts = []
         if matched:
             parts.append(f"would-have-routed PDFs: {', '.join(matched)}")
         if would_skip_as_dup:
             parts.append(f"would-have-skipped-as-duplicate: {', '.join(would_skip_as_dup)}")
         if unmatched:
-            parts.append(f"unmatched PDFs: {', '.join(unmatched)}")
-        if zip_names:
-            parts.append(f"deferred ZIPs (not saved due to all-or-nothing): {', '.join(zip_names)}")
+            parts.append(f"unmatched PDFs (top-level or ZIP-contained): {', '.join(unmatched)}")
         if download_failures:
             parts.append(f"download failures: {', '.join(download_failures)}")
         if invalid_pdfs:
             parts.append(f"invalid PDF bytes (not real PDFs despite .pdf names): {', '.join(invalid_pdfs)}")
+        if unsafe_zips:
+            parts.append(f"unsafe ZIPs: {', '.join(unsafe_zips)}")
         detail = " | ".join(parts) if parts else "no actionable content"
         run.review(
             f"all-or-nothing: '{subject[:60]}' left in Inbox for manual handling — "
             f"{detail}"
         )
+        # Every Inbox email carrying PDF-shaped content the system couldn't fully
+        # resolve gets the red flag so the operator's daily review surfaces it.
+        # ZIP-contained PDFs count as PDF content here — an email whose only
+        # attachment was a silent-content ZIP triggers the flag. Pure signature
+        # / .docx-only emails leave every bucket empty and pass through silently.
+        has_pdf_content = (
+            bool(pdf_outcomes)
+            or bool(download_failures)
+            or bool(invalid_pdfs)
+            or bool(unsafe_zips)
+        )
+        if has_pdf_content:
+            _flag_message_safely(msg_id, subject, run)
         return
 
     # Happy path: every PDF is auto-handleable (matched or duplicate). Commit
@@ -1461,29 +1566,9 @@ def _process_pdf_text_fallback(
         elif outcome == RouteOutcome.DUPLICATE_SKIPPED:
             run.processed += 1
 
-    for a, base_name in zip_atts:
-        try:
-            blob = graph.download_attachment(msg_id, str(a.get("id")))
-        except Exception as exc:
-            run.error(f"download failed for '{subject[:50]}'/{base_name}: {exc}")
-            outcomes.append(RouteOutcome.FAILED)
-            continue
-        out_name = safe_io.sanitize_filename(base_name)
-        dest_path = paths.unmatched_invoices() / out_name
-        try:
-            written = safe_io.safe_write_unique(dest_path, blob)
-            run.processed += 1
-            outcomes.append(RouteOutcome.ROUTED)
-            if written != dest_path:
-                run.info(
-                    f"saved zip to _Unmatched (for Step 2): {written} "
-                    f"(collision-renamed from {dest_path.name})"
-                )
-            else:
-                run.info(f"saved zip to _Unmatched (for Step 2): {written}")
-        except Exception as exc:
-            run.error(f"write failed for {dest_path}: {exc}")
-            outcomes.append(RouteOutcome.FAILED)
+    # ZIPs were inspected in Pass 1 — their contained PDFs are already in
+    # `pdf_outcomes` and routed by the loop above. ZIPs themselves are
+    # never written to disk by Step 1.
 
     # Partial-commit guard (mirrors the subject-matched path): if any
     # attachment failed after others committed, the email otherwise looks like

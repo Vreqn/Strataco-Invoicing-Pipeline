@@ -11,6 +11,429 @@ Versioning: MAJOR.MINOR.PATCH
 
 
 ---------------------------------------------------------------------------
+0.14.1  —  2026-05-13  —  ZIP stem must not leak into filename matcher
+---------------------------------------------------------------------------
+
+Codex adversarial review of 0.14.0 flagged a high-severity defect: when
+Step 1 classified a ZIP-contained PDF, it was passing the synthetic
+`<zipbase>__<inner>.pdf` name into the filename-fallback matcher
+(`match_from_filename_with_base_fallback`). That matcher reads tokens
+left-to-right, so it saw the ZIP filename's plan token FIRST and could
+silently route the PDF to whatever plan the ZIP filename happened to
+mention — overriding what the inner PDF actually said.
+
+Concrete failure case:
+  - ZIP attachment named `BCS2707 invoices.zip`
+  - Inner PDF named `BCS2800 invoice.pdf` (scanned, empty text)
+  - Subject said BCS 2707
+  Before this patch: synthetic name `BCS2707 invoices__BCS2800 invoice.pdf`
+  matched `BCS2707` first → PDF routed to Sue Smith (BCS 2707) silently.
+  Correct behaviour: inner filename says BCS 2800, CLASHes with the
+  subject's BCS 2707 → flag, leave email in Inbox, write nothing.
+
+Fix: split the synthetic name from the classification signal.
+
+  - _process_self_attachments now calls _classify_pdf_against_subject
+    with the bare inner_leaf, then rebrands cls.base_name to the
+    `<zipbase>__<inner>` form so the routed file + audit log still
+    point back at the source ZIP.
+  - _classify_one (the local helper in _process_pdf_text_fallback)
+    gained an optional `route_name` parameter. `classification_name`
+    is what the matcher sees; `route_name` is what lands in
+    pdf_outcomes. Top-level PDF callers pass a single name (no
+    change). ZIP-contained PDF callers pass inner_leaf for
+    classification and `<zipbase>__<inner>` for routing.
+
+ZIP filenames are now NEVER consulted for plan matching. They're
+vendor strings — used only for the audit trail.
+
+Regression tests added (tests/test_step1_zip_intake.py):
+  - test_subject_matched_zip_stem_plan_does_NOT_leak_into_inner_classifier
+    — exact Codex failure case (subject-matched path, CLASH on inner)
+  - test_no_subject_match_zip_stem_plan_does_NOT_route_silent_inner
+    — fallback path with silent inner PDF, ZIP stem has plan token
+
+Both fail under 0.14.0 and pass under 0.14.1. Full suite at landing:
+199 passed (was 197 before this patch).
+
+
+---------------------------------------------------------------------------
+0.14.0  —  2026-05-13  —  Step 1 absorbs ZIP inspection; Steps 2/3 demoted to safety nets
+---------------------------------------------------------------------------
+
+Closes the ZIP-bearing-email orphan risk documented in
+To-Speak-About.txt's 2026-05-13 entry. Email-originated ZIPs no longer
+land in _Unmatched/Invoices/ and never get hidden from the operator's
+Inbox view.
+
+What changed in Step 1:
+  - Both _process_self_attachments and _process_pdf_text_fallback now
+    download each ZIP attachment in memory, audit it with the new
+    tools/_lib/zip_safe.audit_and_extract_pdfs helper, and feed every
+    contained PDF through the same per-PDF classifier the top-level
+    PDFs already use. ZIP-contained PDFs are full participants in the
+    all-or-nothing rule.
+  - The ZIP exemption is gone: an email with an unsafe ZIP, a silent
+    ZIP whose contents can't be plan-matched (no subject/body signal),
+    or a ZIP containing any non-PDF entry stays in the Inbox with the
+    Outlook to-do flag set. Nothing is written to disk.
+  - ZIP files themselves are never written by Step 1. Their useful
+    payload (the PDFs inside) is routed directly to manager folders,
+    named "<zipbase>__<inner>.pdf" so the audit trail still points
+    back at the source ZIP.
+
+What changed in Step 2 and Step 3:
+  - Both steps remain on their existing cron (06:10 / 06:20) as
+    safety nets for operator manual drops into _Unmatched/Invoices/
+    and any future Step 1 partial-commit edge case. On a normal day
+    they find nothing and log "found 0".
+  - Step 2's old _audit_zip + _UnsafeZipError were lifted into the
+    new tools/_lib/zip_safe.py module so Step 1 and Step 2 share the
+    same bomb-protection rules. Step 2 now imports audit_zipfile
+    (lenient — keeps .pdf/.doc/.docx) from there. Step 3's matching
+    logic is unchanged.
+
+Strict-no-non-PDF policy on contained ZIP entries: a ZIP that includes
+a .docx alongside its PDFs forces the email to stay in the Inbox
+flagged. Step 1 has no Word-doc inspector, and the safest
+interpretation of "Inbox is the single source of truth" is to refuse
+to silently part-process such an archive. macOS resource-fork files
+(__MACOSX/, ._foo.pdf) are silently ignored so Mac-authored ZIPs
+don't trip the strict check.
+
+Follow-up tracked in To-Speak-About.txt: once Step 2 / Step 3 logs
+prove they're truly idle on a rolling window, the decommission +
+renumber question (Step 4 -> 2, Step 5 -> 3, etc.) becomes safe to
+revisit.
+
+Files touched:
+  - tools/_lib/zip_safe.py (new)
+  - steps/step_1_intake.py
+  - steps/step_2_unzip.py
+  - workflows/step_1_intake.md
+  - workflows/step_2_unzip.md
+  - workflows/step_3_pdf_sort.md
+  - tests/test_zip_safe.py (new — 10 cases)
+  - tests/test_step1_zip_intake.py (new — 7 cases)
+  - tests/test_step1_pdf_fallback_flag.py (one test renamed + inverted)
+  - tests/test_zip_safety.py (imports repointed)
+  - VERSION
+
+Test suite at landing: 197 passed.
+
+
+---------------------------------------------------------------------------
+0.13.2  —  2026-05-13  —  Step 1: flag PDF-bearing emails on the pdf-text-fallback all-or-nothing path
+---------------------------------------------------------------------------
+
+Background: during a pipeline test the operator noticed that a handful of
+inbox emails which had PDF attachments but no strata number anywhere
+(subject, body, PDF text, or filename) were left in the Inbox WITHOUT an
+Outlook red flag. The dual-factor subject+PDF clash path already flagged
+correctly; the no-subject-match branch did not.
+
+Root cause: Step 1 set the Outlook to-do flag in four places already
+(_process_self_attachments on download failure / invalid PDF bytes /
+FLAG_AND_HOLD / partial commit, _process_prior_attachments via its
+flagged=True return, and _process_pdf_text_fallback's partial-commit
+branch), but the all-or-nothing leave-in-Inbox branch inside
+_process_pdf_text_fallback (steps/step_1_intake.py lines 1412-1447 at
+0.13.1) only called run.review(...). No flag was set. Emails whose PDFs
+the system couldn't identify by text or filename therefore looked
+indistinguishable from ordinary unmatched mail in the operator's daily
+Inbox sweep.
+
+Fix: after the existing run.review(...) at the end of the all-or-nothing
+branch, set the Outlook to-do flag whenever the email carried any
+PDF-shaped content the system couldn't fully resolve. Three buckets are
+checked:
+
+  - pdf_outcomes   — at least one PDF was downloaded (matched, unmatched,
+                     or known duplicate). Covers the motivating case.
+  - download_failures — PDF attachment whose Graph download_attachment
+                     call failed (operator's explicit "anything with a
+                     download failure should definitely get flagged too"
+                     requirement).
+  - invalid_pdfs   — bytes don't start with %PDF- (file named .pdf,
+                     contents are PNG / Word / HTML / etc.).
+
+If all three buckets are empty the branch returns without flagging — that
+covers two deliberate exemptions:
+  - ZIP-only emails take the happy path (saved to _Unmatched/Invoices/
+    for Step 2, email moved to processed_emails). No flag is needed
+    because the email is no longer visible in the operator's Inbox view.
+  - Emails whose only attachments are signature PNGs / .docx / .xlsx are
+    discarded at Pass 1 with an INFO log. Nothing to review.
+
+Out-of-scope, deferred to To-Speak-About.txt: ZIP-bearing emails whose
+unzipped contents end up orphaned in _Unmatched/Invoices/ after Step 2
+and Step 3 can't identify a plan. The email leaves the Inbox in Step 1
+because the ZIP itself is "routable" (Step 2 unpacks downstream), but
+the orphaned PDFs after Step 3 are invisible — no Inbox entry, no daily
+summary line. Solving this is part-policy (pre-peek ZIPs in Step 1 vs.
+orphan summary email from Step 3 vs. sidecar JSON carrying parent plan)
+and is tracked in the 2026-05-13 To-Speak-About.txt entry "ZIP-bearing
+emails: orphan-file risk in _Unmatched/Invoices/" pending the operator's
+decision.
+
+Workflow doc updates:
+  - workflows/step_1_intake.md "Outputs" line 84 — mentions the red flag
+    on the leave-in-Inbox path.
+  - workflows/step_1_intake.md "All-or-nothing rule" section — new
+    paragraph documenting the three-bucket flag-trigger condition and
+    explicitly listing the ZIP-only / discard-only exemptions.
+
+Test coverage:
+  - New file tests/test_step1_pdf_fallback_flag.py exercises
+    _process_pdf_text_fallback end-to-end with graph.list_attachments,
+    graph.download_attachment, graph.flag_message, and
+    graph.move_message_to_folder mocked via unittest.mock.patch.object.
+    Six cases:
+      1. Single unmatched PDF (the motivating case) -> flag set.
+      2. Single PDF with download failure -> flag set.
+      3. Single PDF with invalid bytes (.pdf-named, non-PDF contents)
+         -> flag set.
+      4. Mixed matched + unmatched PDFs (all-or-nothing fires)
+         -> flag set; nothing routed.
+      5. ZIP-only email -> happy path; NO flag; ZIP saved to
+         _Unmatched/Invoices/; email moved to processed folder. Guards
+         against an over-broad fix.
+      6. Signature-PNG-only email -> NO flag; no download even attempted
+         (Pass 1 discard).
+  - Bug-fix protocol followed: tests #1-#4 failed before the code change
+    and pass after; tests #5 and #6 pass on both sides.
+
+Dependencies:
+  - Added `pytest` and `pytest-mock` to requirements.txt. The README's
+    test instruction at line 74 ("run with `pytest tests/`") already
+    pointed at pytest, but a fresh checkout following the install steps
+    would have hit ModuleNotFoundError before any test collected.
+    Codex review flagged this.
+
+Files touched:
+  - steps/step_1_intake.py — single ~7-line insertion at the end of the
+    `if not can_route_all:` block. No other paths changed.
+  - tests/test_step1_pdf_fallback_flag.py — new.
+  - workflows/step_1_intake.md — two edits (Outputs line + new paragraph
+    in the All-or-nothing rule section).
+  - requirements.txt — added pytest, pytest-mock.
+
+Results:
+  - tests/test_step1_pdf_fallback_flag.py: 6 passed.
+  - Full suite: 180 passed (was 174 in 0.13.1; +6 from the new file).
+  - Zero regressions; no other tests touched.
+
+
+---------------------------------------------------------------------------
+0.13.1  —  2026-05-13  —  Test suite: convert standalone scripts to pytest-native
+---------------------------------------------------------------------------
+
+Background: 20 test files in `tests/` were written as "standalone
+scripts" with two cohabiting test runners — pytest discovery on
+`def test_*` AND a `main()` at the bottom that called each test and
+checked some flavour of failure list. The standalone path worked
+correctly (returns 0/1, prints OK/FAIL). The pytest path silently
+rubber-stamped every test as PASS because pytest only fails on `assert`
+or raised exceptions — `return failures` and `FAILED.append(...)` were
+invisible to it.
+
+This was raising 104 `PytestReturnNotNoneWarning`s on every full-suite
+run and, more importantly, meant the CLAUDE.md regression gate
+(`pytest tests/ -v`) didn't actually validate those tests' internals.
+A future bug breaking one of those tests would not have failed CI.
+
+Live-run audit before conversion confirmed nothing was failing silently
+today, so this is a preventative fix.
+
+Two patterns existed in the wild, both fixed here:
+
+  Pattern A — `failures: list[str] = []` inside each test function,
+    `failures.append(...)` / `failures.extend(_expect_x(...))`, then
+    `return failures` at the end. `main()` collects all returned lists
+    and exits 0/1.
+  Pattern B — module-level `FAILED: list[str] = []` with a helper
+    `_check(name, cond, detail)` that does `FAILED.append(name)` on
+    false condition. `test_*` functions return None (looked clean to
+    pytest) but used `_check()` instead of `assert`.
+  Pattern C — `tests/test_stamp_read.py` only: 12 `_check_*` functions
+    (underscore-prefixed, not pytest-discoverable at all) plus a
+    `main()` collector.
+
+0.13.1 converts all of them to pytest-native style:
+
+  - Pattern A → `assert <cond>, f"..."`; `pytest.raises(SomeError)`
+    replaces `_expect_value_error` / `_expect_unsafe`. `return failures`
+    deleted; function signatures change from `-> list[str]` to `-> None`.
+  - Pattern B → module-level `FAILED` + `_check` deleted; each `_check`
+    call becomes `assert cond, name + detail`.
+  - Pattern C → renamed `_check_*` to `test_*`. Where the original
+    iterated cases manually, used `@pytest.mark.parametrize` so each
+    case shows up as its own pytest item.
+  - `main()` standalone runner removed from every file. No production
+    code imports `tests/` — audited via grep across `steps/` and `tools/`.
+  - Fixture builders (`_row`, `_synth_invoice`, `_make_pdf`, `_fixed_dt`,
+    `_make_strataplan_xlsx`, `_set_env`/`_restore_env`, `_msg`,
+    `_processed_row`, etc.) stay as-is — they're data builders, not
+    assertion helpers.
+
+Files touched (20):
+  Pattern A — test_aggregate_filename.py, test_aggregation_ledger.py,
+    test_check_sort_key.py, test_collect_diagnostics.py,
+    test_dup_fingerprint.py, test_dup_ledger.py, test_graph.py,
+    test_history_split.py, test_log.py, test_pdf_merge.py,
+    test_plan_match.py, test_safe_io.py, test_step1_decision.py,
+    test_step1_filename_first.py, test_strataplan_snapshot.py,
+    test_xls.py, test_zip_safety.py
+  Pattern B — test_inbox_report.py, test_step6_scans.py,
+    test_step6_summary_email.py
+  Pattern C — test_stamp_read.py
+
+Docs updated:
+  - README.md and HANDOFF.md previously instructed running tests via
+    `python tests/<file>.py (no pytest needed)`. Both now point at
+    `pytest tests/`. CLAUDE.md (which already named pytest as the
+    runner) is now consistent with reality.
+
+Results:
+  - Full suite: `148 passed, 104 warnings` -> `174 passed, 0 warnings`.
+  - The +26 net test count is `test_stamp_read.py`'s 12 `_check_*`
+    functions becoming actually-discoverable, expanded via parametrize
+    (parse_paid_date: 11 cases; mocks: 3 cases). No tests were removed;
+    no test scenarios were dropped.
+  - Zero production-code changes. Zero new dependencies.
+
+What this DOESN'T do:
+  - No change to test coverage scope. Same scenarios, same fixtures,
+    same expected outcomes — just real pytest assertions now.
+  - The pre-existing CLAUDE.md "fixture/golden pair" convention for
+    tools without tests yet is still a separate, larger project.
+
+
+---------------------------------------------------------------------------
+0.13.0  —  2026-05-13  —  Stamp placement: never cover totals or invoice #
+---------------------------------------------------------------------------
+
+Background: the 2026-05-12 live run on `LMS 3297 - Invoice-611226.pdf`
+dropped a Received stamp directly across the Subtotal / GST / PST /
+Total / Amount Paid / Amount Due / Account Balance rows — the most
+important numbers on the page. The pre-0.13 placement algorithm in
+`tools/_lib/stamp.py::find_largest_whitespace_box` was content-agnostic:
+when neither the strict (>=99.5% white) nor loose (>=98.5% white)
+whitespace pass found a candidate, it fell through to a hard-coded
+`(FALLBACK_X_PT = 360, FALLBACK_Y_PT = 60)` in the lower-RIGHT — exactly
+where invoices universally put the totals block.
+
+Krisztian's rule (2026-05-13): the stamp must always land on page 1.
+Covering line-item text is acceptable. Covering the totals block or
+the invoice-number row is never acceptable.
+
+0.13.0 adds semantic exclusion zones, a last-resort search tier, and
+flips the absolute-last-resort fallback to the lower-LEFT for
+defense-in-depth.
+
+  A. **Semantic forbidden bands.** Page-1 text is scanned via the
+     existing `pdfplumber` integration (`tools/_lib/pdf_text.py::
+     extract_page_words` — already a project dep, no new packages).
+     Words are clustered into reading lines by `top` coordinate
+     (2pt tolerance), then each line's normalized tokens are matched
+     against two label sets:
+
+       - Totals block: `Subtotal`, `Total`, `Invoice Total`,
+         `Grand Total`, `Total Due`, `Amount Due`, `Amount Owing`,
+         `Balance Due`, `Balance Owing`, `Amount Paid`,
+         `Account Balance`, `GST`, `PST`, `HST`.
+       - Invoice number: `Invoice #`, `Invoice No`, `Invoice Number`,
+         `Inv #`, `Inv No`.
+
+     Token-boundary matching only (so `Subtotal` is its own label,
+     not a substring of `Total`; `Invoice Date` does NOT match
+     `Invoice Number`; `Account # 5078` does NOT match `Invoice #`).
+     Each matched line becomes a full-width horizontal band padded
+     by `BAND_PAD_PT = 4` on top and bottom.
+
+  B. **Three-tier search instead of two.** Each tier respects both
+     the existing page-edge margin AND the new forbidden bands:
+
+       1. Strict — `WHITE_PCT_MIN >= 0.995` + per-row clean +
+          exclusion-free.
+       2. Loose — `WHITE_PCT_FALLBACK >= 0.985` + exclusion-free.
+       3. Last-resort (new) — `min_total = 0`, no whitespace floor.
+          Picks the cleanest exclusion-free rectangle even if it
+          overlaps line-item text. Totals and invoice # stay
+          readable; everything else is fair game.
+
+  C. **Lower-LEFT hard-coded fallback.** `FALLBACK_X_PT` flips from
+     `360` (lower-right) to `PAGE_MARGIN_PT = 36` (lower-left). Only
+     used in the degenerate case where the target rectangle is larger
+     than the entire unforbidden region of the page — essentially
+     impossible on a real invoice. Rationale: even if forbidden-band
+     extraction itself fails (corrupted PDF, pdfplumber raises) and
+     we have no semantic protection, the worst-case landing zone is
+     now the side of the page that's overwhelmingly empty on real
+     invoices, not the side where vendors put the totals.
+
+  D. **Both stamps covered automatically.** Received and Paid both
+     go through `_render_stamp -> find_largest_whitespace_box`. No
+     call-site changes in `steps/step_1_intake.py` or
+     `steps/step_5_to_ap.py`. When the Paid stamp runs in Step 5,
+     the Received stamp has been flattened into pixels — pdfplumber
+     sees the baked rows as additional text but none of them match
+     the totals/invoice# label sets, so no spurious bands.
+
+  E. **Soft failure mode for text extraction.** If `extract_page_words`
+     raises for any reason, `_extract_forbidden_bands` logs a
+     warning and returns `[]`. The stamp pipeline keeps working
+     (just without semantic protection); the lower-left fallback is
+     the last line of defense in that case.
+
+
+Tests added: `tests/test_stamp.py` — twelve new pytest tests:
+
+  Label-matching units:
+    - normalize_strips_trailing_punctuation
+    - subtotal_matches_total_label_set_but_is_distinct_from_total
+    - invoice_date_is_not_an_invoice_number
+    - invoice_hash_matches_invoice_number
+    - amount_due_matches_total_set
+    - account_number_is_not_a_totals_label
+
+  Placement behaviour:
+    - stamp_avoids_totals_block             (mid-density invoice)
+    - stamp_avoids_invoice_number_row       (upper-page band detected)
+    - old_fallback_case_now_avoids_totals   (regression of record:
+        dense invoice with totals in old-fallback zone, asserts
+        placement is NOT at the (360, 60) coords)
+    - fallback_is_lower_left                (early-return path,
+        asserts x_pt == PAGE_MARGIN_PT, not 360)
+    - clean_invoice_unchanged               (regression guard for
+        the easy case)
+    - paid_stamp_after_received_avoids_totals (end-to-end: Received
+        + flatten + Paid placement, both must avoid bands)
+
+Full suite (`pytest tests/ -v`): 148 passed, 0 failures. The 104
+warnings are pre-existing PytestReturnNotNoneWarnings in unrelated
+test files (test_step1_filename_first, test_strataplan_snapshot,
+test_xls, test_zip_safety) and not caused by this change.
+
+
+### Technical references
+
+  - `tools/_lib/stamp.py`:
+      - module-level: `_TOTAL_LABELS_RAW`, `_INVOICE_NUMBER_LABELS_RAW`,
+        `_TOTAL_LABEL_TOKENS`, `_INVOICE_NUMBER_LABEL_TOKENS`,
+        `_ALL_FORBIDDEN_LABEL_TOKENS`, `BAND_PAD_PT`, updated
+        `FALLBACK_X_PT`
+      - helpers: `_normalize_token`, `_group_words_into_lines`,
+        `_line_matches_any_label`, `_extract_forbidden_bands`,
+        `_intersects_any_band`
+      - rewired: `find_largest_whitespace_box` (three-tier search,
+        band filter, last-resort tier)
+  - `tools/_lib/pdf_text.py::extract_page_words` — drop-in for
+    word-level bboxes (already existed, no changes).
+  - `tests/test_stamp.py` — the twelve regression tests above.
+
+
+---------------------------------------------------------------------------
 0.12.1  —  2026-05-13  —  Codex review follow-ups on the 0.12.0 stamp flatten
 ---------------------------------------------------------------------------
 

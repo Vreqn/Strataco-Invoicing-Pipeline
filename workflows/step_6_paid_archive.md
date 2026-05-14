@@ -1,7 +1,7 @@
 # Step 6 — Archive paid invoices into Strata Plan folders + send morning "Invoices summary"
 
 ## Objective
-For each AP user, scan their `Paid_Invoices` folder. The accountant has filled in the Paid stamp (Date + Check Number) in Acrobat and saved the PDF normally — Step 6 reads the values straight from the AcroForm fields, flattens the PDF as part of the archive write, and copies it into the matching `Strata_Plans/<plan>/` archive folder under the convention `{check} - {MM} - {PLAN} {MonthName} {YYYY} inv.pdf`. The archived copy is fully flat: no editable fields anywhere.
+For each AP user, scan their `Paid_Invoices` folder. The accountant has filled in the Paid stamp (Date + Check Number) in Acrobat and saved the PDF in place (Ctrl+S) — Step 6 reads the values straight from the AcroForm fields, flattens the PDF as part of the archive write, and copies it into the matching `Strata_Plans/<plan>/` archive folder under the convention `{check} - {MM} - {PLAN} {MonthName} {YYYY} inv.pdf`. The archived copy is fully flat: no editable fields anywhere.
 
 After the archive loop, Step 6 also produces the operator's single morning report: it scans every pipeline folder where the automation should have drained the queue, queries the Inbox for unhandled emails, and bundles everything into one `Invoices summary` email — see "Outputs" below.
 

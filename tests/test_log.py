@@ -4,9 +4,6 @@ Specifically covers the 0.2.0 fix to `daily_log`: when another run already
 holds the per-step lockfile, the contextmanager must yield a `_Run` object
 with `status == "skipped"` (instead of crashing with the pre-fix
 `RuntimeError: generator didn't yield`).
-
-Standalone: no pytest dependency. Run with `python tests/test_log.py`.
-Exits 0 on success, 1 on failure.
 """
 
 from __future__ import annotations
@@ -33,8 +30,7 @@ def _close_strataco_log_handlers(step: str) -> None:
         logger.removeHandler(h)
 
 
-def test_daily_log_skipped_on_lock_collision() -> list[str]:
-    failures: list[str] = []
+def test_daily_log_skipped_on_lock_collision() -> None:
     step = "test_collision_step"
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         # Point both LOG_DIR and STRATACO_ROOT at the temp dir so the config
@@ -47,12 +43,10 @@ def test_daily_log_skipped_on_lock_collision() -> list[str]:
         os.environ.setdefault("MAILBOX_UPN", "test@example.com")
         os.environ.setdefault("NOTIFY_DEFAULT_EMAIL", "test@example.com")
 
-        # Late import so the env vars above are picked up.
         from tools._lib.log import daily_log
 
         lockfile = Path(td) / f".{step}.lock"
 
-        # Hold the lock from a separate Lock instance to simulate a concurrent run.
         holder = portalocker.Lock(
             str(lockfile),
             mode="w",
@@ -61,54 +55,19 @@ def test_daily_log_skipped_on_lock_collision() -> list[str]:
         )
         holder.acquire()
         try:
-            # Now opening daily_log for the SAME step should yield a skipped run.
             entered = False
             saw_status = None
-            try:
-                with daily_log(step) as run:
-                    entered = True
-                    saw_status = run.status
-                    # Body should be a no-op when status == "skipped". If a real run
-                    # got through, it would touch run.processed; we don't.
-            except RuntimeError as exc:
-                failures.append(
-                    f"[collision] daily_log raised RuntimeError (the pre-fix bug): {exc}"
-                )
-                return failures
-            except Exception as exc:
-                failures.append(
-                    f"[collision] daily_log raised unexpected {type(exc).__name__}: {exc}"
-                )
-                return failures
+            with daily_log(step) as run:
+                entered = True
+                saw_status = run.status
 
-            if not entered:
-                failures.append("[collision] with-block body never executed")
-            if saw_status != "skipped":
-                failures.append(
-                    f"[collision] expected run.status == 'skipped', got {saw_status!r}"
-                )
+            assert entered, "with-block body never executed"
+            assert saw_status == "skipped", (
+                f"expected run.status == 'skipped', got {saw_status!r}"
+            )
         finally:
             try:
                 holder.release()
             except Exception:
                 pass
-            # Detach the file handler so Windows can clean up the temp dir.
             _close_strataco_log_handlers(step)
-
-    return failures
-
-
-def main() -> int:
-    fails = test_daily_log_skipped_on_lock_collision()
-    status = "OK  " if not fails else "FAIL"
-    print(f"{status}[daily_log skip on lock collision] ({len(fails)} failure{'s' if len(fails) != 1 else ''})")
-    if fails:
-        print("\nFAILURES:")
-        for f in fails:
-            print(f"  - {f}")
-        return 1
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

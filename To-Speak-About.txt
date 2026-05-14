@@ -16,6 +16,125 @@ entry — ignore them unless a developer asks.
 
 
 --------------------------------------------------------------------------
+2026-05-13  —  Multi-PDF email with suffix-variant plans: route or hold?
+--------------------------------------------------------------------------
+
+Background: The system currently flags any email that contains multiple
+PDFs whose plans are suffix variants of the same base (e.g. LMS 4193C
+and LMS 4193T, or EPS 4280 and EPS 4280A). This is the "plan bases
+collide" failsafe — designed to catch vendors who confused two very
+similar plans and sent invoices for both under a single subject line.
+But when each PDF clearly identifies its own variant (PDF text agrees
+with filename per-PDF, and the two PDFs point at different variants),
+the flag is conservative and forces the front desk to ask the vendor
+to resend the email split per plan.
+
+The distinct-base case (BCS 2707 + BCS 2800 in one email) is already
+handled by AUTO_SPLIT — each PDF routes to its own plan with no
+intervention. The question is whether suffix variants deserve the
+same treatment, or whether the historical risk (vendor labelling
+confusion) outweighs the convenience.
+
+Example: Vendor sends one email with two invoices. Invoice A's PDF
+text and filename both clearly say "LMS 4193C." Invoice B's both
+clearly say "LMS 4193T." Today the system flags the email because
+the bases collide ("LMS 4193"). The front desk asks the vendor to
+resend as two separate emails; each then routes cleanly. Possible
+behaviour: route both automatically, since both PDFs are
+unambiguous.
+
+  Option A — Keep flagging (strict). The front desk asks the vendor
+             to resend split per plan, or asks for the developer to
+             intervene. Safe, but slow whenever a single vendor
+             genuinely bills two suffix variants together.
+
+  Option B — Auto-route when each PDF confidently identifies its own
+             variant. Each PDF goes to its own manager; subject is
+             ignored. Faster, but trusts the vendor's per-PDF
+             labelling completely — a vendor who *did* confuse the
+             variants would get silently mis-routed.
+
+  Option C — Hybrid. Auto-route only when (1) PDF text agrees with
+             filename per-PDF AND (2) the two PDFs point at different
+             variants AND (3) no other classifier returned AMBIGUOUS.
+             Any uncertainty falls back to flagging. Most conservative
+             of the auto-route options.
+
+How this affects the front desk: under Option A (today), the front
+desk's recipe for a suffix-variant flag is "ask the vendor to resend
+split." Under B or C, the front desk never sees these — the system
+handles them.
+
+Decision:
+
+
+  Technical references:
+  - steps/step_1_intake.py::_decide_email_action — "Multiple PDFs,
+    plan bases collide" branch is the FLAG path; "Multiple PDFs,
+    distinct plan bases" is the AUTO_SPLIT path that B/C would
+    model on.
+  - plan_match.plan_base reduces "LMS 4193C" and "LMS 4193T" both
+    to "LMS 4193" — same convention as xls.base_plan_index.
+  - workflows/step_1_intake.md's decision-matrix table documents
+    the current behaviour.
+
+
+--------------------------------------------------------------------------
+2026-05-13  —  Decommission Steps 2 and 3 once logs prove they're idle?
+--------------------------------------------------------------------------
+
+Background: 0.14.0 collapsed the intake pipeline so Step 1 handles ZIP
+unpacking + per-PDF plan matching in memory at email intake. Steps 2
+and 3 still run on cron (06:10 / 06:20) as safety nets for manual
+operator drops into _Unmatched/Invoices/ and for any future Step 1
+partial-commit edge case. In normal operation they should find nothing
+and log "found 0" on every run.
+
+The question is whether to leave them in place indefinitely or tear
+them out (and renumber Steps 4-7 down to 2-5) once we have evidence
+they're truly idle.
+
+  Option 1 — Keep them indefinitely. Zero ongoing cost. Useful belt-
+             and-braces for the rare manual-drop case.
+
+  Option 2 — Decommission after a fixed observation window (e.g. 8-12
+             weeks of all-zero logs). Delete the scripts, workflow
+             docs, tests, and cron entries. Renumber Step 4 -> Step 2,
+             Step 5 -> Step 3, etc. Update
+             workflows/duplicate_detection.md:23 which references
+             Step 3 as a duplicate-detection safety net.
+
+  Option 3 — Decommission only the scripts but leave the
+             _Unmatched/Invoices/ scan in Step 6 (where it already
+             lives). Manual drops become Step 6-visible orphans that
+             the operator handles by hand. Don't renumber.
+
+How to evaluate: grep logs/step_2_*.log and logs/step_3_*.log for any
+line that isn't "found 0 zip(s)" / "found 0 PDF(s)" over a rolling
+window. If the count is genuinely zero across the window, Option 2 or
+3 is safe.
+
+Decision:
+_to be filled in after enough log data has accumulated_
+
+
+--------------------------------------------------------------------------
+2026-05-13  —  ZIP-bearing emails: orphan-file risk in _Unmatched/Invoices/
+                — Resolved (see ReleaseNotes.txt 0.14.0 + 0.14.1)
+--------------------------------------------------------------------------
+
+Step 1 now opens ZIP attachments in memory at intake and routes each
+contained PDF through the same per-PDF classifier top-level PDFs
+already get. ZIPs themselves are never written to `_Unmatched/Invoices/`
+anymore; if any contained PDF can't be plan-matched (or the ZIP fails
+the safety audit), the parent email stays in the Inbox with the
+Outlook red flag — same gesture the operator already trains on for
+subject↔PDF clashes. Steps 2 and 3 remain on cron as safety nets for
+manual operator drops only; the decommission-or-renumber question is
+tracked as a separate entry at the top of this file.
+
+
+--------------------------------------------------------------------------
 2026-05-13  —  Boilerplate-sibling PDF flags: keep strict-first or loosen?
 --------------------------------------------------------------------------
 
@@ -100,99 +219,42 @@ _to be filled in after Krisztian discusses with his dad / client_
 
 
 --------------------------------------------------------------------------
-2026-05-12  —  PDF cross-validation + Outlook to-do flag (decided, strict-first)
+2026-05-12  —  Per-vendor "trust the PDF outright" relaxations
 --------------------------------------------------------------------------
 
-Background: subject-line plan matching alone had two failure modes:
-  (1) vendor types the wrong plan in the subject; the correct one is
-      inside the PDF; we silently route to the wrong manager.
-  (2) multi-strata emails (one email with invoices for three different
-      properties) all get force-routed to whichever plan the subject
-      mentioned first.
+Open follow-up from the 2026-05-12 strict-first decision: should we
+eventually whitelist specific vendors as "trust the PDF outright" once
+we've built up a track record of clean labelling? That would mean a
+single-PDF subject↔PDF clash routes via the PDF (not flagged) when the
+sender domain is on the whitelist. Maintained in `Strataplan_List.xlsx`
+or a sibling sheet, NOT in code, so the operator can manage it without
+a deploy.
 
-What Step 1 now does, on every email where the subject (or body)
-matched a plan: scan each PDF with `match_from_pdf_text` and combine
-the per-PDF outcomes into a single email-level action.
-
-  - Every PDF agrees with subject (or returns no text) -> route normally.
-  - Multi-PDF, every PDF has a distinct strata base (e.g. BCS 2707 +
-    BCS 2800)                                          -> AUTO_SPLIT
-    Each PDF goes to its own manager, subject ignored.
-  - Single PDF disagrees with subject; or two+ PDFs agree on a plan
-    that isn't the subject's; or the PDFs share a base but differ in
-    suffix (LMS 4193C vs LMS 4193T); or any PDF is ambiguous
-                                                       -> FLAG
-    Outlook "Flag as to-do" set on the message, email stays in the
-    Inbox, nothing written to disk. Operator sees a red flag, reviews,
-    marks complete (green checkmark) when handled.
-
-Strict-first stance: when in doubt, flag. Mis-sorting silently is
-worse than over-flagging. Once strata managers prove their labelling
-is reliable, we can relax specific cases — e.g. trust the PDF over
-the subject on single-PDF clashes, or auto-route some suffix-variant
-combinations.
-
-Closes:
-  - Question 1 of the 2026-05-11 multi-PDF entry below ("invoices for
-    DIFFERENT properties").
-  - The latent subject-vs-PDF clash risk that wasn't a written
-    To-Speak-About entry but came up in conversation.
-
-Open follow-ups (not blocking):
-  - Per-vendor relaxations: should we whitelist certain vendors as
-    "trust the PDF outright" once we have a track record? Maintained
-    in `Strataplan_List.xlsx` or a sibling sheet, NOT in code.
-  - Whether the suffix-variant failsafe should differentiate between
-    "PDFs all share a base WITH a known unique manager" (technically
-    safe to auto-route to that manager) vs. "shared base with multiple
-    managers" (genuinely ambiguous, must flag). Out of scope until we
-    see real frequency in the daily log.
+Decision:
+_to be filled in after a few months of strict-first operational data —
+the daily log will show which vendors trigger clash-flags most often
+and which of those are false positives vs. genuine mis-labels_
 
 
-### Hardening notes (0.10.1, 2026-05-12)
+--------------------------------------------------------------------------
+2026-05-12  —  PDF cross-validation + Outlook to-do flag
+                — Resolved (see ReleaseNotes.txt 0.10.0 + 0.10.1)
+--------------------------------------------------------------------------
 
-A code review of 0.10.0 surfaced three additional cases where the red
-flag (or its absence) is the operator's signal. None of these are
-policy questions — they're correctness fixes — but worth knowing:
+Subject-line matching alone was missing two failure modes (vendor types
+the wrong plan in the subject; multi-strata emails get force-routed by
+subject). Step 1 now classifies every PDF against the subject's plan
+via the AGREE/EMPTY/AMBIGUOUS/CLASH matrix in
+`_classify_pdf_against_subject`, combined into an email-level action by
+`_decide_email_action`: distinct plan bases auto-split per PDF;
+suffix-variant clashes or ambiguous cases set the Outlook to-do flag
+and leave the email in the Inbox. Strict-first: when in doubt, flag.
 
-  1. **Partial commits also flag.** If a multi-PDF email starts routing
-     (PDF #1 lands in a manager folder, PDF #1 is now in the duplicate
-     ledger) and PDF #2 then fails (download error, write error,
-     missing manager), the email gets the red flag with a
-     `partial commit on '<subject>'` log line. Important: this is the
-     ONE flag case where some PDFs have ALREADY been routed. The
-     operator should expect to reconcile by hand (delete the half-
-     routed PDF from the manager folder OR keep it and manually
-     route the missing one) rather than reply-to-self.
-
-  2. **Flagged-via-conversation priors stay quarantined.** When a
-     reply-to-self triggers a clash flag, the *original* PDF-bearing
-     message also stays in the Inbox (not moved to processed_emails).
-     This means a single clash event leaves TWO messages visible in
-     the Inbox — the reply (flagged) and the original (unflagged).
-     Treat them as a pair when reconciling.
-
-  3. **Flag-set failure is logged but invisible to the operator.** If
-     Microsoft Graph fails the PATCH that sets the to-do flag (rare:
-     permission scope, rate-limit, schema change), the email stays in
-     the Inbox WITHOUT a red flag and looks like ordinary unmatched
-     mail. The daily log will have a `FLAG_SET_FAILED:` line — admins
-     should grep for this prefix periodically and reconcile by hand
-     until the underlying Graph problem is fixed.
-
-
-### Technical references (hand these to a developer)
-
-  - `steps/step_1_intake.py::_classify_pdf_against_subject` — per-PDF
-    classifier (AGREE / EMPTY / AMBIGUOUS / CLASH).
-  - `steps/step_1_intake.py::_decide_email_action` — pure function that
-    combines classifications into ROUTE_AS_SUBJECT / AUTO_SPLIT /
-    FLAG_AND_HOLD.
-  - `tools/_lib/plan_match.py::plan_base` — strips a single trailing
-    letter (matches `xls.base_plan_index` convention).
-  - `tools/_lib/graph.py::flag_message` — PATCH the message's `flag`
-    property to `{flagStatus: flagged}`.
-  - `tests/test_step1_decision.py` — covers every cell of the matrix.
+Closes: 2026-05-11 multi-PDF Q1 ("invoices for different properties")
+plus a latent subject-vs-PDF clash risk. Two follow-up questions remain
+open: per-vendor "trust the PDF outright" relaxations (entry above) and
+the suffix-variant route-or-hold question (2026-05-13 entry near the
+top of this file).
 
 
 --------------------------------------------------------------------------
