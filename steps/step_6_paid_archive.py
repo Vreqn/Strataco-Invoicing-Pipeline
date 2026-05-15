@@ -474,6 +474,8 @@ def _scan_unmatched_intake() -> _ScanResult:
             continue
         if _is_os_junk(p.name):
             continue
+        if p.suffix.lower() == '.log':
+            continue
         result.rows.append({
             "fileName": p.name,
             "localPath": str(p),

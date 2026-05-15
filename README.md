@@ -208,14 +208,22 @@ Each script is independent. A failure in one does NOT block the others. See [wor
 
 ## Scheduling on Windows Task Scheduler
 
+Each step has a launcher in `schedulers\` (e.g. `schedulers\step_1_intake.bat`). Point Task Scheduler at the bat file — not at `python.exe` directly.
+
 Register the six daily tasks. For each one:
 
 - **Trigger**: Daily, Mon–Fri, at the time in the table above.
 - **Action**: Start a program
-  - Program/script: `python` (or the full path to your `python.exe`)
-  - Arguments: `steps\step_N_xxx.py` (e.g. `steps\step_1_intake.py`)
-  - Start in: the project root (`q:\AI Automation\Strataco Invoicing`)
+  - Program/script: full path to the bat file, e.g. `C:\Automations\Strataco Invoicing\schedulers\step_1_intake.bat`
+  - Arguments: *(leave blank)*
+  - Start in: *(leave blank — the bat file sets its own working directory)*
 - **Settings**: "Stop the task if it runs longer than 30 minutes" is a sensible safety net.
+
+**Why bat files, not python directly:** Task Scheduler runs tasks as a background service process. Mapped network drives (Q:, Z:, etc.) are only available inside an interactive user session — at 6 am before anyone logs in, they don't exist. Running Python directly with a mapped drive as "Start in" produces return code 0x80070002 ("file not found") before the script even starts. The bat files use `cd /d "%~dp0.."` to set the working directory from their own location (a local `C:\` path), which is always available regardless of login state.
+
+**If `python` is not found:** Task Scheduler's system PATH can differ from an interactive shell. If a task fails immediately with no log output, open the bat file and replace `python` with the full path to your interpreter, e.g. `C:\Users\Attila\AppData\Local\Programs\Python\Python313\python.exe`. Run `where python` in a Command Prompt on the deploy machine to find the right path.
+
+Each bat file appends its stdout/stderr to a local `logs\step_N_task.log` in the project root. This captures startup crashes (import errors, missing `.env`) that occur before the Python logger initialises. The Python logger writes its own dated logs to `STRATACO_ROOT\logs\step_N_<date>.log` as usual.
 
 Step 7 (monthly) gets its own task with a **monthly trigger** instead of daily. Pick a day between the 5th and 10th of each month (late enough that prior-month invoices have settled, early enough that the operator hasn't forgotten). The script always aggregates the previous calendar month by default.
 

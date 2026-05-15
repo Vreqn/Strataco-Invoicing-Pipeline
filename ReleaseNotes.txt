@@ -11,6 +11,52 @@ Versioning: MAJOR.MINOR.PATCH
 
 
 ---------------------------------------------------------------------------
+0.19.1  —  2026-05-15  —  Task Scheduler bat launchers + scan filter fix
+---------------------------------------------------------------------------
+
+Task Scheduler: bat file launchers for all steps (schedulers/)
+  Running steps directly via python.exe in Task Scheduler fails with return
+  code 0x80070002 when the working directory is missing or inaccessible at
+  task launch time (common with mapped network drives before a user logs in).
+
+  Seven bat launchers added under schedulers/:
+    step_1_intake.bat  step_2_unzip.bat  step_3_pdf_sort.bat
+    step_4_pending_email.bat  step_5_to_ap.bat  step_6_paid_archive.bat
+    step_7_aggregate.bat
+
+  Each launcher:
+    - Sets the working directory via cd /d "%~dp0.." (relative to its own
+      location — works wherever the repo is cloned, no hardcoded paths).
+    - Creates logs\ if missing (if not exist "logs" mkdir "logs") so a
+      fresh clone never fails the redirect before Python starts.
+    - Appends stdout/stderr to logs\step_N_task.log (startup-crash capture,
+      separate from the dated network logs at STRATACO_ROOT\logs\).
+
+  Task Scheduler setup: point "Program/script" at the bat file; leave
+  "Arguments" and "Start in" blank. The bat file handles both. See README
+  "Scheduling on Windows Task Scheduler" for the full updated guide.
+
+Bug fix — _scan_unmatched_intake() filtered too broadly (step_6_paid_archive.py)
+  The previous fix for a stale cleanup_unmatched.log artifact used an
+  extension allowlist ({'.pdf', '.zip'}) that silently hid all non-PDF/ZIP
+  files from the morning action-required email — including legitimately stuck
+  .docx and other non-invoice files. The test test_intake_mixed_contents
+  (which asserts that baz.docx surfaces) was broken by this.
+
+  Fix: replaced the allowlist with a targeted filter that only skips .log
+  files (the actual pipeline artifact type). All other file types now surface
+  as before. New test test_intake_log_artifact_filtered added.
+
+  Operator action: delete cleanup_unmatched.log from
+  \\strtdc\Invoices\_Unmatched\Invoices\ — it is an orphaned artifact from
+  a pre-0.19.0 deployment run and will not reappear.
+
+  Changed files:
+  - steps/step_6_paid_archive.py: _scan_unmatched_intake() filter line
+  - tests/test_step6_scans.py: test_intake_log_artifact_filtered added
+
+
+---------------------------------------------------------------------------
 0.19.0  —  2026-05-14  —  Step 7: new output layout + two Codex P2 bug fixes
 ---------------------------------------------------------------------------
 

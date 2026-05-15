@@ -93,6 +93,19 @@ def test_intake_mixed_contents() -> None:
         assert all(r.get("mtimeIso") for r in result.rows), "all_have_mtime"
 
 
+def test_intake_log_artifact_filtered() -> None:
+    """A .log file left in _Unmatched/Invoices (pipeline artifact) is silently
+    skipped; a real invoice alongside it still surfaces."""
+    with _RootContext() as root:
+        folder = root / "_Unmatched" / "Invoices"
+        folder.mkdir(parents=True)
+        (folder / "cleanup_unmatched.log").write_text("log artifact")
+        (folder / "real_invoice.pdf").write_text("pdf bytes")
+        result = _scan_unmatched_intake()
+        names = {r["fileName"] for r in result.rows}
+        assert names == {"real_invoice.pdf"}, f"log filtered: got {names}"
+
+
 def test_intake_os_junk_filtered() -> None:
     """OS metadata files (.DS_Store, AppleDouble sidecars, Thumbs.db,
     desktop.ini) reach shared folders via file-server browsing. They must
