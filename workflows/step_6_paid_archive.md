@@ -6,8 +6,9 @@ For each AP user, scan their `Paid_Invoices` folder. The accountant has filled i
 After the archive loop, Step 6 also produces the operator's single morning report: it scans every pipeline folder where the automation should have drained the queue, queries the Inbox for unhandled emails, and bundles everything into one `Invoices summary` email — see "Outputs" below.
 
 ## Behavioural changes vs. the old N8n flow
-1. **No `Paid -` filename filter** — every PDF in `Paid_Invoices` is processed (still skipping `Processed -` and files whose `Processed - <name>` already exists).
+1. **No `Paid -` filename filter** — every PDF in `Paid_Invoices` is processed. `Processed -` prefixed files (legacy markers written by pre-0.17.0 runs) are skipped.
 2. **Destination filename follows the client's archive convention** — `{check} - {MM} - {PLAN} {MonthName} {YYYY} inv.pdf`, with check number AND date both read from the flattened Paid stamp. The original vendor filename is dropped from the archive name.
+3. **True move (0.17.0+)** — after a successful archive write the source PDF is deleted from `Paid_Invoices/`. No `Processed - <name>.pdf` marker is written back. Deduplication lives in the dup ledger (SHA-256); a second run on a leftover source is a safe no-op.
 
 ## Schedule
 07:00 Mon–Fri.
@@ -22,13 +23,13 @@ After the archive loop, Step 6 also produces the operator's single morning repor
   - `<STRATACO_ROOT>/Strata_Plans/<plan_raw>/<check_number> - <MM> - <PLAN> <MonthName> <YYYY> inv.pdf`.
     Example: `12345 - 03 - BCS1234 March 2026 inv.pdf`. `<PLAN>` is the
     normalised, no-space form of the plan (`BCS1234`, not `BCS 1234`).
-  - `<STRATACO_ROOT>/Users/<AP>/Paid_Invoices/Processed - <original_name>.pdf` (so it isn't re-archived; this marker keeps the original vendor filename for operator recognition).
+  - The source PDF in `Paid_Invoices/` is deleted after the archive write succeeds.
 - One consolidated `Invoices summary` email to `config.notify_email()` (`NOTIFY_OVERRIDE_EMAIL` during shadow, `NOTIFY_DEFAULT_EMAIL` post-cutover). Always sent — a silent inbox is a real "Step 6 didn't fire" signal. Subject: `Invoices summary — X processed, Y action required, Z duplicate — YYYY-MM-DD`. Three sections:
   - `== Processed ==` — files archived this morning, grouped by AP.
   - `== Action Required ==` — four sub-sections, each omitted when empty:
     - **Paid invoices stuck (Step 6 couldn't archive)** — AP `Paid_Invoices/` files where the check number / date couldn't be read, the plan wasn't in the XLS, etc.
     - **Manager approvals stuck (Step 5 didn't pick up)** — files sitting in any manager's `Approved/` folder at 07:00.
-    - **Unmatched intake files (Steps 1/2/3 couldn't route)** — non-`Processed-` files in `_Unmatched/Invoices/`.
+    - **Unmatched intake files (Steps 1/2/3 couldn't route)** — non-`Processed-` files in `_Unmatched/Invoices/`. OS-generated metadata files (`.DS_Store`, AppleDouble `._*` sidecars, `Thumbs.db`, `desktop.ini`) are filtered out — they reach shared folders via file-server browsing and are never pipeline content.
     - **Inbox emails (unhandled)** — live Graph query of the Inbox root; or a degraded "query failed" notice when Graph is unreachable. The error case counts as +1 in the subject's `action required` total so the subject always reflects what the body says.
     - **Pipeline scan errors** — appears only when one or both filesystem scans hit a per-folder error (e.g. permission denied on a manager's `Approved/`). Each error string lists which folder failed; the rest of the scan still ran, so this sub-section coexists with the other Action Required rows when applicable.
   - `== Duplicates ==` — fingerprint matches caught today (filtered to rows whose `last_dup_date` equals today's date).
@@ -58,6 +59,6 @@ python steps/step_6_paid_archive.py
 6. The `Strata_Plans/<plan>/` folder is missing AND can't be created (permissions issue).
 
 ## When something fails
-- For "Could not read Check Number" / "Could not read Date": open the PDF in Acrobat, confirm both Paid-stamp fields actually have a value typed in, then save normally (Ctrl+S). Step 6 reads the AcroForm directly and flattens automatically on archive — no manual flatten step required. For the Date field, the format the stamp emits by default (`MAY 08 2026`) is the safest; long-form (`May 8, 2026`) and ISO (`2026-05-08`) also parse cleanly.
-- For "PDF appears image-only (likely Microsoft 'Print to PDF')": the operator flattened the PDF by printing it. Re-open the original (form-bearing) copy from the manager's `Approved/` folder (`Processed - <name>.pdf`), have the AP fill it again, and save with Ctrl+S — do NOT print.
+- For "Could not read Check Number" / "Could not read Date": open the PDF in Acrobat, confirm both Paid-stamp fields actually have a value typed in, then save normally (Ctrl+S). Step 6 reads the AcroForm directly and flattens automatically on archive — no manual flatten step required. For the Date field, the format the stamp emits by default (`MAY 08 2026`) is the safest; long-form (`May 8, 2026`) and ISO (`2026-05-08`) also parse cleanly. As of 0.16.0 the Paid stamp prints a small grey `format:  MMM DD YYYY` caption in the PAID title band so whoever fills it sees the expected format — the caption sits off every field's read baseline and carries no digits, so it can't be mistaken for a value.
+- For "PDF appears image-only (likely Microsoft 'Print to PDF')": the AP flattened the PDF by printing it. Since 0.17.0, there is no `Processed -` backup in the manager's `Approved/` folder (true-move). Contact the developer, who can recover the form-bearing copy from the dup ledger's `archive_path` and re-stamp it via Step 5. Once a fresh form-bearing copy is in `Paid_Invoices/`, have the AP fill the stamp fields, save with Ctrl+S, and re-run Step 6.
 - For "Plan not in XLS": add the row, the next run picks it up.

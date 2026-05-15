@@ -10,6 +10,8 @@ Pull invoice attachments out of the testinvsml@stratacomgmt.com Inbox, identify 
 - `<STRATACO_ROOT>/Strataplan_List.xlsx` — Strata Plan ↔ Manager ↔ AP master list.
 - The mailbox's `Inbox` folder (latest 500 messages).
 - An `Inbox/processed_emails` subfolder (must exist; created manually once).
+- An `Inbox/duplicate_emails` subfolder (must exist; created manually once).
+- An `Inbox/Action_Required` subfolder (must exist; created manually once — the front desk's daily work queue).
 - Azure app-reg credentials in `.env` (`TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET`).
 
 ## Matching order (first hit wins)
@@ -57,7 +59,7 @@ Each PDF gets classified into one of five outcomes (`PdfOutcome` in `steps/step_
 |---|---|
 | **AGREE** | PDF text confidently identifies the same plan as the subject. |
 | **EMPTY** | PDF has no extractable text (scanned image / no text layer). No evidence either way. |
-| **NO_PLAN** | PDF has extractable text but carries **no strata plan number at all** — neither a managed-plan token (`match_from_pdf_text`) **nor** a token the document explicitly labels "Strata Plan …" (`plan_match.find_explicit_plan_tokens`). When it's the *lone* PDF this carries no evidence either way and is treated like EMPTY (route on subject — the genuine "vendor invoice that never prints the plan #" case, 0.15.0). When it has *siblings*, it flags the whole email — see the email-level action table below (0.15.2). |
+| **NO_PLAN** | PDF has extractable text but carries **no strata plan number at all** — neither a managed-plan token (`match_from_pdf_text`) **nor** a token the document explicitly labels "Strata Plan …" (`plan_match.find_explicit_plan_tokens`). When it's the *lone* PDF this carries no evidence either way and is treated like EMPTY (route on subject — the genuine "vendor invoice that never prints the plan #" case). When it has *siblings*, it is skipped in routing and the email is forwarded to the plan manager — see the email-level action table below. |
 | **AMBIGUOUS** | PDF text names a plan but it didn't resolve — a managed-prefix token the matcher couldn't pick, two equally-scored managed candidates, **or** a plan the PDF explicitly labels "Strata Plan …" whose prefix/number isn't in `Strataplan_List.xlsx` (e.g. "Strata Plan KAS 9999"). The explicit-wording scan is what catches unmanaged-*prefix* plans — `match_from_pdf_text`'s detector only sees managed prefixes. |
 | **CLASH** | PDF confidently identifies a *different* managed plan than the subject. |
 
@@ -67,8 +69,8 @@ The per-PDF classifications are combined into a single email-level action by `_d
 |---|---|
 | Every PDF is AGREE | **ROUTE_AS_SUBJECT** — stamp using subject's plan. |
 | Lone PDF, EMPTY or NO_PLAN | **ROUTE_AS_SUBJECT** — a single PDF with no evidence against the subject is trusted to the subject's plan. |
-| Multi-PDF, any NO_PLAN | **FLAG** — a plan-less PDF sitting next to siblings hasn't cleared the dual-factor bar; we can't tell a plan-less real invoice from a plan-less boilerplate notice the vendor stapled on. Hold the whole email for the front desk rather than stamping and filing a guess. (0.15.2 — fixes the 2026-05-14 `FSC_Fuel_Surcharge_.pdf` mis-route. Whether multi-PDF **EMPTY** should be held the same way is an open policy question — see `To-Speak-About.txt`.) |
-| Multi-PDF, AGREE + EMPTY only (no NO_PLAN) | **ROUTE_AS_SUBJECT** — current behaviour; a scanned sibling is still trusted to the subject. |
+| Multi-PDF, any NO_PLAN | **ROUTE_AS_SUBJECT + FORWARD_TO_MANAGER** — AGREE/EMPTY PDFs are stamped and filed; NO_PLAN PDF siblings are skipped (not stamped). The full original email (all attachments) is forwarded to the plan manager, then moved to `processed_emails`. The manager decides what to do with the plan-less attachment. |
+| Multi-PDF, AGREE + EMPTY only (no NO_PLAN) | **ROUTE_AS_SUBJECT** — a scanned sibling is trusted to the subject. |
 | Any PDF is AMBIGUOUS | **FLAG** — strict-first, don't trust ambiguous evidence. |
 | Mix of EMPTY/NO_PLAN and CLASH | **FLAG** — can't safely route a no-plan PDF when its sibling disagrees with the subject. |
 | All PDFs CLASH on the same plan (≠ subject) | **FLAG** — consensus clash, vendor likely mislabelled the subject. |
@@ -84,10 +86,11 @@ The per-PDF classifications are combined into a single email-level action by `_d
 ## Outputs
 - Matched PDFs (subject/body match OR fallback) at `<STRATACO_ROOT>/Users/<Manager>/Invoices/To_Approve/<plan> - <name>.pdf` (Received stamp applied). ZIP-contained PDFs use `<zipbase>__<inner>.pdf` as their base name so the audit trail preserves the source ZIP.
 - ZIP attachments are inspected in memory and their PDFs routed directly — **the ZIP file itself is never saved to `_Unmatched/Invoices/` by Step 1**. (The directory continues to exist for the Step 2/3 safety-net jobs that drain operator manual drops.)
-- Non-PDF/non-ZIP attachments (signature images, .docx, .xlsx) are **discarded at intake** with an INFO log — not saved anywhere.
-- Subject/body-matched emails are moved to `Inbox/processed_emails`.
+- Non-PDF/non-ZIP attachments (signature images, .docx, .xlsx) are **discarded at intake** with an INFO log — not saved anywhere. If such extras appear alongside a successfully routed invoice, the full email is forwarded to the plan manager.
+- Subject/body-matched emails are moved to `Inbox/processed_emails`. If the email contained extras (non-PDF attachments or NO_PLAN PDF siblings), it is also forwarded to the plan manager before being moved.
 - Successfully PDF-text-fallback-routed emails (every PDF — top-level OR ZIP-contained — text- or filename-matched a plan; every ZIP passed the safety audit) are routed and moved to `processed_emails`.
-- **All-or-nothing leave-in-Inbox rule:** any email that doesn't get a subject/body match AND has an unmatched PDF, invalid PDF bytes, an unsafe ZIP (non-PDF entries, bomb, encrypted), or a download failure stays in the Inbox **with the Outlook red flag set** and nothing written to disk. Discarded non-PDF/non-ZIP attachments do NOT trigger the rule. The email itself is the recovery surface; the operator replies-to-self with the corrected subject and the next morning's conversation-link pass routes everything in the thread together.
+- **All-or-nothing leave-in-Inbox rule:** any email that doesn't get a subject/body match AND has an unmatched PDF, invalid PDF bytes, an unsafe ZIP (non-PDF entries, bomb, encrypted), or a download failure stays in the Inbox (temporarily — see end-of-run sweep below) **with the Outlook red flag set** and nothing written to disk. Discarded non-PDF/non-ZIP attachments do NOT trigger the rule. The email itself is the recovery surface; the operator replies-to-self with the corrected subject and the next morning's conversation-link pass routes everything in the thread together.
+- **End-of-run inbox sweep:** after the main processing loop finishes, Step 1 calls `list_inbox_messages()` one final time and moves every remaining message to `Inbox/Action_Required`. This covers unmatched emails (with red flags set), any general correspondence, and anything else left over. The front desk monitors `Action_Required` as her daily work queue — the main Inbox stays clean for new arrivals. If `Action_Required` doesn't exist, the sweep is skipped with a warning and those emails remain in the Inbox until the folder is created.
 - One row appended to `logs/daily_summary.csv` (7 columns: `date, step, processed, need_review, errors, duration_sec, status`) and a detailed log at `logs/step_1_<date>.log`.
 
 ## All-or-nothing rule (for emails without a subject/body plan match)
@@ -117,7 +120,7 @@ python steps/step_1_intake.py
 ```
 
 ## Tools used
-- [tools/_lib/graph.py](../tools/_lib/graph.py) — `list_inbox_messages`, `list_conversation_messages`, `list_attachments`, `download_attachment`, `find_child_folder_id`, `move_message_to_folder`, `flag_message`.
+- [tools/_lib/graph.py](../tools/_lib/graph.py) — `list_inbox_messages`, `list_conversation_messages`, `list_attachments`, `download_attachment`, `find_child_folder_id`, `move_message_to_folder`, `flag_message`, `forward_message`.
 - [tools/_lib/xls.py](../tools/_lib/xls.py) — `load_plans`, `plan_to_manager`.
 - [tools/_lib/plan_match.py](../tools/_lib/plan_match.py) — `pick_from_subject`, `match_from_pdf_text`, `pretty_plan`, `plan_base`.
 - [tools/_lib/pdf_text.py](../tools/_lib/pdf_text.py) — `extract_full_text` (pdfplumber on a bytes blob; no disk write).
@@ -127,9 +130,9 @@ python steps/step_1_intake.py
 
 ## Front-desk recovery workflow (unidentified invoices)
 
-When the automation can't identify a strata plan from subject, body, or PDF text, the email stays in the Inbox. The front-desk recipe lives in [`docs/client_training_brief.md`](../docs/client_training_brief.md) under "Recovery Workflow."
+When the automation can't identify a strata plan from subject, body, or PDF text, the email ends up in `Inbox/Action_Required` (moved there by the end-of-run sweep after the red flag is set). The front-desk recipe lives in [`docs/client_training_brief.md`](../docs/client_training_brief.md) under "Recovery Workflow."
 
-System side: the unidentified email is the recovery surface. No file is written to disk. The reply-to-self triggers the next 06:00 pass's conversation-link path: the matched-subject reply finds its prior message in the same `conversationId`, pulls the PDF from that prior, routes it, and moves both messages to `processed_emails`.
+System side: the unidentified email is the recovery surface. No file is written to disk. The reply-to-self (the corrected forward the front desk sends) goes to the Inbox, where the next 06:00 pass's conversation-link path picks it up: the matched-subject reply finds its prior message in the same `conversationId`, pulls the PDF from that prior, routes it, and moves both messages to `processed_emails`.
 
 ## Front-desk workflow for flagged emails
 
@@ -144,7 +147,7 @@ For the rare partial-commit flag, the front desk escalates to the developer rath
 - **Mislabeled PDFs (octet-stream, no extension)**: heuristic in `_looks_like_pdf_or_zip` keeps anything that smells like an invoice in the name or subject. Codex review noted this can drop a real PDF with weak Graph metadata (no extension, octet-stream, no invoice hint) — accepted as-is for now per `To-Speak-About.txt` triage; vendors in practice include filenames.
 - **Imposter `.pdf` files (PNG/JPEG bytes in a PDF-named file)**: caught by `_is_real_pdf` magic-byte check after download. Email is flagged via `run.review()` and left in the Inbox; the operator can inspect.
 - **Multiple attachments per email**: behaviour depends on the matching branch.
-  - *Subject/body matched* → the new PDF cross-validation (see above) decides per-PDF, then `_decide_email_action` picks ROUTE_AS_SUBJECT / AUTO_SPLIT / FLAG_AND_HOLD for the email as a whole.
+  - *Subject/body matched* → per-PDF cross-validation decides each PDF's fate; `_decide_email_action` picks ROUTE_AS_SUBJECT / AUTO_SPLIT / FLAG_AND_HOLD for the email as a whole. When the action is ROUTE_AS_SUBJECT or AUTO_SPLIT **and** the email had extras (non-PDF attachments discarded in Pass 1, or NO_PLAN PDF siblings skipped in routing), the full original email is forwarded to the plan manager and then moved to `processed_emails`.
   - *No subject/body match* → the all-or-nothing rule from `_process_pdf_text_fallback` still applies. The email moves to `processed_emails` only if every PDF (top-level or ZIP-contained) text- or filename-matched a plan and every ZIP passed the in-memory safety audit; any unmatched PDF, invalid PDF bytes, unsafe ZIP, or download failure forces leave-in-Inbox with nothing written. Discarded non-PDF/non-ZIP top-level attachments do NOT gate the rule.
 - **Scanned (image-only) PDFs**: `extract_full_text` returns empty and `match_from_pdf_text` reports `"No text extracted (scanned PDF?)."`. Behaviour depends on the branch:
   - *Subject/body matched* → classified as `EMPTY`; routes on the subject's plan (no clash evidence on either side).

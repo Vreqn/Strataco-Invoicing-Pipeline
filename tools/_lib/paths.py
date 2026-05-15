@@ -8,6 +8,7 @@ same relative layout under STRATACO_ROOT.
 
 from __future__ import annotations
 
+import calendar
 from pathlib import Path
 
 from tools._lib import config, safe_io
@@ -83,9 +84,12 @@ def strata_plan_folder(plan_raw: str) -> Path:
 
 
 def strata_plan_processed_month(plan_raw: str, year: int, month: int) -> Path:
-    """Per-month archive subfolder used by Step 7 to park merged source PDFs."""
+    """Per-month archive subfolder used by Step 7 to park source PDFs and the summary."""
     name = _safe_component(plan_raw)
-    return _under_root(root() / "Strata_Plans" / name / "Processed" / f"{year:04d}-{month:02d}")
+    month_folder = f"{month:02d} - {calendar.month_name[month]}"
+    return _under_root(
+        root() / "Strata_Plans" / name / "Processed" / f"{year:04d}" / month_folder
+    )
 
 
 def monthly_aggregations_csv() -> Path:

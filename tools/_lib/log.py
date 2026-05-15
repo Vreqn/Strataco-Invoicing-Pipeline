@@ -36,6 +36,14 @@ _SUMMARY_HEADER = ["date", "step", "processed", "need_review", "errors", "durati
 # the first time `_append_summary_row` opens them under the new version.
 _SUMMARY_HEADER_LEGACY = ["date", "step", "processed", "errors", "duration_sec", "status"]
 
+# Bounded retry on lock acquisition: a momentary collision (e.g. the
+# collect_diagnostics lock probe, or two steps briefly racing at startup)
+# resolves within the retry window instead of forcing a spurious skip. A
+# genuinely-running prior step holds its lock for its whole duration, so it
+# still skips once the window elapses.
+LOCK_ACQUIRE_TIMEOUT_S = 3.0
+LOCK_CHECK_INTERVAL_S = 0.25
+
 
 class _Run:
     def __init__(self, step: str, logger: logging.Logger):
@@ -183,11 +191,16 @@ def daily_log(step: str):
     log_dir.mkdir(parents=True, exist_ok=True)
     lockfile = log_dir / f".{step}.lock"
 
-    # Acquire the per-step lock — non-blocking, yield a skipped run if another holder owns it.
+    # Acquire the per-step lock. `Lock.acquire()` retries every
+    # LOCK_CHECK_INTERVAL_S for up to LOCK_ACQUIRE_TIMEOUT_S — long enough to
+    # ride out a momentary collision (the collect_diagnostics probe, two steps
+    # racing at startup), short enough that a genuinely-running prior step
+    # still yields a skipped run once the window elapses.
     lock = portalocker.Lock(
         str(lockfile),
         mode="w",
-        timeout=0,
+        timeout=LOCK_ACQUIRE_TIMEOUT_S,
+        check_interval=LOCK_CHECK_INTERVAL_S,
         flags=portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING,
     )
     try:

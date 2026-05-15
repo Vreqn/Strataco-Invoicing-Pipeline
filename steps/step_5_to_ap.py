@@ -100,6 +100,162 @@ def _build_ap_email(ap: PlanRow, today_str: str, folder: Path, summary: history.
     return subject, body
 
 
+def _transfer_one(
+    pdf_path: Path,
+    plan_map: dict[str, PlanRow],
+    base_index: dict[str, list[PlanRow]],
+    ledger: dup_ledger.Ledger,
+    run,
+) -> None:
+    """Transfer one manager-approved PDF to the AP's Approved_Invoices folder.
+
+    True-move: ledger update is fail-closed and moved to after the destination
+    write, so the source is only deleted once both the AP copy is on disk and
+    the ledger reflects the new stage. No Processed- marker is written.
+    """
+    name = pdf_path.name
+
+    _, plan_norm = plan_match.plan_from_filename(name)
+    if not plan_norm:
+        run.info(f"no plan in filename, skipping: {name}")
+        return
+
+    ap_row = _resolve_ap(plan_norm, plan_map, base_index)
+    if not ap_row:
+        run.info(f"no AP match for plan {plan_norm} ({name})")
+        return
+
+    try:
+        pdf_bytes = pdf_path.read_bytes()
+    except Exception as exc:
+        run.error(f"read {pdf_path}: {exc}")
+        return
+
+    # Duplicate-detection safety net: a manager may have manually
+    # dragged a PDF into Approved/ that Step 1 never saw. Catch it
+    # before the accountant wastes a Paid stamp on it.
+    sha = dup_fingerprint.sha256_of(pdf_bytes)
+    inv_num, amount = dup_fingerprint.compute_layer_b(pdf_bytes, plan_norm)
+    # Same as Step 3: no email context here, so Layer B is a no-op.
+    duplicate = ledger.find_by_hash(sha)
+    if duplicate is not None and duplicate.current_stage == "overridden":
+        duplicate = None
+    if duplicate is None:
+        duplicate = ledger.find_by_semantic_key(plan_norm, inv_num, amount, "")
+    overridden = None
+    if duplicate is None:
+        overridden = ledger.find_overridden_by_hash(sha)
+        if overridden is None:
+            overridden = ledger.find_overridden_by_semantic_key(
+                plan_norm, inv_num, amount, "",
+            )
+
+    # Was this sha already in the ledger at a normal stage?
+    # Drives the "advance stage vs insert orphan" decision at ledger update.
+    prior_same_sha = ledger.find_by_hash(sha)
+    if prior_same_sha is not None and prior_same_sha.current_stage in ("overridden", "superseded"):
+        prior_same_sha = None
+
+    if duplicate is not None:
+        # Fail-closed: if the ledger increment fails, leave source in place
+        # for retry. No DUPLICATE marker written.
+        try:
+            updated = ledger.increment_dup_count(duplicate.sha256)
+            archive_hint = duplicate.archive_path or f"({duplicate.current_stage})"
+            run.info(
+                f"duplicate skipped in Approved/: {name} "
+                f"(sha={sha[:12]}..., matches {duplicate.sha256[:12]}..., "
+                f"original at {archive_hint}, dup_count={updated.dup_count})"
+            )
+        except Exception as exc:
+            run.error(
+                f"ledger increment failed for {sha[:12]}...: {exc} — "
+                f"leaving source for retry"
+            )
+            return
+        try:
+            pdf_path.unlink(missing_ok=True)
+        except Exception as exc:
+            run.error(f"could not unlink {pdf_path} after dup detection: {exc}")
+        return
+
+    # Flatten the manager-filled Received-stamp values (and any vendor
+    # /AcroForm fields the manager touched) into static page text BEFORE
+    # adding the new editable Paid stamp. Fail closed: leave source for retry.
+    try:
+        flat_bytes = flatten_acroform(pdf_bytes)
+    except Exception as exc:
+        run.error(f"flatten failed for {name}: {exc} — leaving source for retry")
+        return
+
+    # Pass sha so Paid stamp field names are deterministic, enabling
+    # safe_write_unique to detect an identical prior write on retry.
+    try:
+        stamped = render_paid_stamp(flat_bytes, sha=sha)
+    except Exception as exc:
+        run.error(f"paid stamp failed for {name}: {exc} — saving unstamped")
+        stamped = flat_bytes
+
+    ap_dest = paths.ap_approved_invoices(ap_row.ap_name) / safe_io.sanitize_filename(name)
+    try:
+        ap_written = safe_io.safe_write_unique(ap_dest, stamped)
+    except Exception as exc:
+        run.error(f"write {ap_dest}: {exc}")
+        return
+
+    # Fail-closed ledger update: source only deleted after ledger confirms
+    # the destination write. Moving ledger update to after the write means
+    # the stage never advances without a real AP copy on disk.
+    new_row = dup_ledger.make_row(
+        sha256=sha,
+        plan_norm=plan_norm,
+        invoice_number=inv_num,
+        amount_cents=amount,
+        current_stage="ap_queue",
+    )
+    try:
+        if prior_same_sha is not None:
+            ledger.update_stage(sha, "ap_queue")
+        elif overridden is not None and overridden.sha256 != sha:
+            try:
+                ledger.consume_override_and_insert(
+                    old_sha256=overridden.sha256,
+                    new_row=new_row,
+                )
+                run.info(
+                    f"consumed Layer B override at AP transfer for {name} "
+                    f"(retired {overridden.sha256[:12]}..., inserted {sha[:12]}...)"
+                )
+            except ValueError as exc:
+                run.info(
+                    f"override at {overridden.sha256[:12]}... already consumed "
+                    f"({exc}); inserting {sha[:12]}... as new"
+                )
+                ledger.upsert(new_row)
+        else:
+            ledger.upsert(new_row)
+    except Exception as exc:
+        run.error(
+            f"ledger update at AP transfer failed for {sha[:12]}... ({name}): {exc} — "
+            f"leaving source for retry"
+        )
+        return
+
+    try:
+        pdf_path.unlink(missing_ok=True)
+    except Exception as exc:
+        run.error(f"could not unlink original {pdf_path}: {exc}")
+
+    run.processed += 1
+    if ap_written != ap_dest:
+        run.info(
+            f"transferred {name} ({plan_norm}) -> {ap_written} "
+            f"(collision-renamed from {ap_dest.name})"
+        )
+    else:
+        run.info(f"transferred {name} ({plan_norm}) -> {ap_written}")
+
+
 def _transfer_phase(rows: list[PlanRow], ledger: dup_ledger.Ledger, run) -> None:
     """Manager Approved -> AP Approved_Invoices, applying the Paid stamp."""
     plan_map = plan_to_ap(rows)
@@ -113,181 +269,7 @@ def _transfer_phase(rows: list[PlanRow], ledger: dup_ledger.Ledger, run) -> None
             name = pdf_path.name
             if name.lower().startswith("processed -") or name.lower().startswith("processed-"):
                 continue
-
-            _, plan_norm = plan_match.plan_from_filename(name)
-            if not plan_norm:
-                run.info(f"no plan in filename, skipping: {name}")
-                continue
-
-            ap_row = _resolve_ap(plan_norm, plan_map, base_index)
-            if not ap_row:
-                run.info(f"no AP match for plan {plan_norm} ({name})")
-                continue
-
-            try:
-                pdf_bytes = pdf_path.read_bytes()
-            except Exception as exc:
-                run.error(f"read {pdf_path}: {exc}")
-                continue
-
-            # Duplicate-detection safety net: a manager may have manually
-            # dragged a PDF into Approved/ that Step 1 never saw. Catch it
-            # before the accountant wastes a Paid stamp on it.
-            #   - find_by_hash returns rows regardless of stage; we treat
-            #     overridden as "route normally" and superseded as a normal
-            #     duplicate.
-            #   - find_by_semantic_key already excludes overridden/superseded.
-            #   - find_overridden_* surface the override case for consumption.
-            sha = dup_fingerprint.sha256_of(pdf_bytes)
-            inv_num, amount = dup_fingerprint.compute_layer_b(pdf_bytes, plan_norm)
-            # Same as Step 3: no email context here, so Layer B is a no-op
-            # (blank sender_domain). Manager-dragged orphans rely on Layer A.
-            duplicate = ledger.find_by_hash(sha)
-            if duplicate is not None and duplicate.current_stage == "overridden":
-                duplicate = None
-            if duplicate is None:
-                duplicate = ledger.find_by_semantic_key(plan_norm, inv_num, amount, "")
-            overridden = None
-            if duplicate is None:
-                overridden = ledger.find_overridden_by_hash(sha)
-                if overridden is None:
-                    overridden = ledger.find_overridden_by_semantic_key(
-                        plan_norm, inv_num, amount, "",
-                    )
-
-            # Was this fingerprint (sha) already on file in a normal stage?
-            # Drives the "advance stage vs insert orphan" decision below.
-            # Excludes overridden (will go through consume path) and
-            # superseded (would otherwise resurrect an inert row).
-            prior_same_sha = ledger.find_by_hash(sha)
-            if prior_same_sha is not None and prior_same_sha.current_stage in ("overridden", "superseded"):
-                prior_same_sha = None
-
-            if duplicate is not None:
-                try:
-                    updated = ledger.increment_dup_count(duplicate.sha256)
-                    archive_hint = duplicate.archive_path or f"({duplicate.current_stage})"
-                    run.info(
-                        f"duplicate skipped in Approved/: {name} "
-                        f"(sha={sha[:12]}..., matches {duplicate.sha256[:12]}..., "
-                        f"original at {archive_hint}, dup_count={updated.dup_count})"
-                    )
-                except Exception as exc:
-                    run.error(f"ledger increment failed for {sha[:12]}...: {exc}")
-
-                # Rename in place — same Processed-prefix convention as the
-                # normal path so Step 5 skips it on the next run.
-                dup_marker = approved / safe_io.sanitize_filename(
-                    f"Processed - DUPLICATE - {name}"
-                )
-                try:
-                    safe_io.safe_write_unique(dup_marker, pdf_bytes)
-                except Exception as exc:
-                    run.error(
-                        f"could not write DUPLICATE marker for {name}: {exc} — "
-                        f"leaving source in place (it WILL be re-detected next run)"
-                    )
-                    continue
-                try:
-                    pdf_path.unlink(missing_ok=True)
-                except Exception as exc:
-                    run.error(f"could not unlink {pdf_path} after dup marker: {exc}")
-                continue
-
-            # Pass-through: either this sha is already in the ledger (advance
-            # its stage), or it's a brand-new sha — either an orphan that
-            # bypassed Step 1, or the regenerated-bytes side of an override
-            # whose old row we should now retire.
-            new_row = dup_ledger.make_row(
-                sha256=sha,
-                plan_norm=plan_norm,
-                invoice_number=inv_num,
-                amount_cents=amount,
-                current_stage="ap_queue",
-            )
-            try:
-                if prior_same_sha is not None:
-                    # Normal path: PDF came through Step 1, row exists by sha.
-                    # Advance stage to ap_queue.
-                    ledger.update_stage(sha, "ap_queue")
-                elif overridden is not None and overridden.sha256 != sha:
-                    # Layer B override consume — retire the old override row.
-                    try:
-                        ledger.consume_override_and_insert(
-                            old_sha256=overridden.sha256,
-                            new_row=new_row,
-                        )
-                        run.info(
-                            f"consumed Layer B override at AP transfer for {name} "
-                            f"(retired {overridden.sha256[:12]}..., inserted {sha[:12]}...)"
-                        )
-                    except ValueError as exc:
-                        run.info(
-                            f"override at {overridden.sha256[:12]}... already consumed "
-                            f"({exc}); inserting {sha[:12]}... as new"
-                        )
-                        ledger.upsert(new_row)
-                else:
-                    # Orphan: manager dragged a fresh PDF directly into
-                    # Approved/. Insert a self-healing row.
-                    ledger.upsert(new_row)
-            except Exception as exc:
-                run.error(
-                    f"ledger update at AP transfer failed for {sha[:12]}... ({name}): {exc}"
-                )
-
-            # Flatten the manager-filled Received-stamp values (and any
-            # vendor /AcroForm fields the manager touched) into static
-            # page text BEFORE adding the new editable Paid stamp. By the
-            # time the AP sees the file, the manager's data is locked.
-            try:
-                flat_bytes = flatten_acroform(pdf_bytes)
-            except Exception as exc:
-                run.error(
-                    f"flatten failed for {name}: {exc} — leaving source for retry"
-                )
-                continue
-
-            try:
-                stamped = render_paid_stamp(flat_bytes)
-            except Exception as exc:
-                run.error(f"paid stamp failed for {name}: {exc} — saving unstamped")
-                stamped = flat_bytes
-
-            # Drop the "Approved - " prefix — preserve the original name.
-            ap_dest = paths.ap_approved_invoices(ap_row.ap_name) / safe_io.sanitize_filename(name)
-            try:
-                ap_written = safe_io.safe_write_unique(ap_dest, stamped)
-            except Exception as exc:
-                run.error(f"write {ap_dest}: {exc}")
-                continue
-
-            # Write the Processed marker BEFORE unlinking the original — if
-            # this fails, the source PDF stays in place so the operator can
-            # investigate, and Step 5 retries it on the next run.
-            processed_path = approved / safe_io.sanitize_filename(f"Processed - {name}")
-            try:
-                safe_io.safe_write_unique(processed_path, pdf_bytes)
-            except Exception as exc:
-                run.error(
-                    f"could not write processed marker for {name}: {exc} — "
-                    f"leaving source in place; AP copy already at {ap_written}"
-                )
-                run.processed += 1
-                continue
-            try:
-                pdf_path.unlink(missing_ok=True)
-            except Exception as exc:
-                run.error(f"could not unlink original {pdf_path}: {exc}")
-
-            run.processed += 1
-            if ap_written != ap_dest:
-                run.info(
-                    f"transferred {name} ({plan_norm}) -> {ap_written} "
-                    f"(collision-renamed from {ap_dest.name})"
-                )
-            else:
-                run.info(f"transferred {name} ({plan_norm}) -> {ap_written}")
+            _transfer_one(pdf_path, plan_map, base_index, ledger, run)
 
 
 def _notification_phase(rows: list[PlanRow], today_str: str, run) -> None:

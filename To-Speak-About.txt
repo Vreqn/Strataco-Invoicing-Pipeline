@@ -16,6 +16,124 @@ entry — ignore them unless a developer asks.
 
 
 --------------------------------------------------------------------------
+PRE-LAUNCH FLAG  —  NOTIFY_OVERRIDE_EMAIL must be cleared before go-live
+--------------------------------------------------------------------------
+
+This is not a policy question — it is a go-live checklist item. Read this
+when Krisztian asks "are we ready to implement for real?" or similar.
+
+What is active right now:
+  NOTIFY_OVERRIDE_EMAIL is set in .env (and shown in .env.example).
+  While it is set, ALL outbound emails — Step 4 summaries AND Step 1
+  manager forwards — are redirected to that address instead of the real
+  strata managers.
+
+  The Step 1 forward path was previously missing this redirect. It was
+  added on 2026-05-14 so that test runs don't send live emails to managers.
+
+What must happen before go-live:
+  1. Remove (or blank out) NOTIFY_OVERRIDE_EMAIL from the production .env.
+  2. Confirm with Krisztian / dad that the Strataplan_List.xlsx "Manager email"
+     column is populated and correct for every active plan.
+  3. Run one test email through Step 1 and verify the forward reaches the
+     intended manager address, not the override.
+
+Technical reference:
+  graph.resolve_recipient() in tools/_lib/graph.py:334 — applies override.
+  Called at: steps/step_1_intake.py:1437, steps/step_1_intake.py:1635,
+  and steps/step_4_pending_email.py:98.
+
+
+--------------------------------------------------------------------------
+2026-05-14  —  AUTO_SPLIT + non-invoice extras: forward to which manager(s)?
+--------------------------------------------------------------------------
+
+Question
+  When Step 1 routes an email as AUTO_SPLIT (two PDFs for two different
+  strata plans in the same email) AND the email also carries non-invoice
+  attachments (e.g. a .docx or a plan-less PDF), which manager receives
+  the forwarded email?
+
+Example
+  An email contains three files:
+    - BCS2707 - Invoice.pdf  → auto-split to BCS 2707's manager
+    - EPS4280 - Invoice.pdf  → auto-split to EPS 4280's manager
+    - Contract.docx          → discarded at intake (not an invoice)
+  Both invoices are filed correctly. But who gets the Contract.docx?
+
+Options
+  A. Forward to all managers involved in the split (one forward per manager).
+     Both managers see the extras; each can decide if it's relevant to them.
+  B. Forward to the first split manager only (the first PDF's plan).
+     Simpler; one manager is responsible for chasing the other if needed.
+  C. Don't forward in AUTO_SPLIT + extras cases at all; flag the email instead.
+     Keeps the inbox rule strict; front desk handles it manually.
+
+Decision
+  Option A (2026-05-14) — Forward to all managers involved. Implemented as Change D
+  in v0.16.0: for every AUTO_SPLIT action, the system collects all unique manager
+  emails from per_pdf_plan and sends a separate forward to each.
+
+Technical reference
+  _process_self_attachments in steps/step_1_intake.py — currently forwards
+  to the first split manager (option B). The AUTO_SPLIT + non-PDF-extras
+  combination is rare in practice (AUTO_SPLIT only fires when distinct plan
+  bases appear in the same email, which is already unusual).
+
+
+--------------------------------------------------------------------------
+2026-05-14  —  Legacy "Processed -" marker files: leave them, sweep, or auto-clean?
+--------------------------------------------------------------------------
+
+Issue: Steps 3, 5, and 6 have been refactored to true-move (0.17.0). Going
+forward, no `Processed -` or `Processed-YYYYMMDD-*` files are written back
+into source folders. However, any such files created by earlier runs remain
+on disk — they are full-PDF duplicates occupying space in the following
+folders:
+
+  - `_Unmatched/Invoices/` — `Processed-YYYYMMDD-HHMMSS-<name>.pdf`
+    (written by Step 3 before 0.17.0)
+  - `Users/<Manager>/Approved/` — `Processed - <name>.pdf`
+    (written by Step 5 before 0.17.0)
+  - `Users/<AP>/Paid_Invoices/` — `Processed - <name>.pdf`
+    (written by Step 6 before 0.17.0)
+
+The `_is_processed()` / `startswith("Processed -")` guards in each step
+still skip these files on every run, so nothing breaks. They are harmless
+noise.
+
+Why it's a policy question: how these files are cleaned up depends on who
+has access to the file server and how much storage / visual clutter they
+cause. The developer can do a one-time sweep safely; the operator cannot
+(they don't touch those folders). Automation is riskier because a
+poorly-scoped delete rule could accidentally remove real invoices.
+
+  Option A — Leave them indefinitely. They cost disk space (each is a full
+             PDF copy) but cause no functional problem. No action required.
+
+  Option B — One-time manual sweep by the developer. After the 0.17.0
+             deploy, Krisztian opens each folder on the file server and
+             deletes files matching `Processed - *.pdf` and
+             `Processed-2*-*.pdf`. Low risk if done carefully; one-time
+             effort.
+
+  Option C — Dated one-shot cleanup step. Add a small script that deletes
+             only `Processed -` / `Processed-YYYYMMDD-*` files older than
+             the 0.17.0 deploy date, runs once, then self-disables. Safer
+             than a manual sweep (scope-limited) but more code to write
+             and verify.
+
+Decision:
+
+
+  Technical references:
+  - steps/step_3_pdf_sort.py — `_route_one`: no marker written since 0.17.0.
+  - steps/step_5_to_ap.py   — `_transfer_one`: no marker written since 0.17.0.
+  - steps/step_6_paid_archive.py — `_archive_one`: no marker written since
+    0.17.0. `_is_processed()` still skips legacy files.
+
+
+--------------------------------------------------------------------------
 2026-05-13  —  PDF references an unmanaged strata plan: what happens to it?
 --------------------------------------------------------------------------
 
@@ -79,6 +197,9 @@ processed manually — they're rare enough that a defined automated path
 may not be worth building.
 
 Decision:
+  Front desk discretion (2026-05-14). Option A — contact the vendor to confirm
+  the plan; if the invoice isn't one we manage, the front desk deletes the email
+  or moves it to Handled to break the loop. No code change needed.
 
 
   Technical references:
@@ -145,6 +266,10 @@ split." Under B or C, the front desk never sees these — the system
 handles them.
 
 Decision:
+  Option A for now (2026-05-14). Route-per-PDF to respective managers for suffix-
+  variant plans with different managers is future work once the overall pipeline is
+  stable. Currently, when two PDFs in one email map to suffix variants of the same
+  base but point to different managers, the email still flags.
 
 
   Technical references:
@@ -194,7 +319,8 @@ window. If the count is genuinely zero across the window, Option 2 or
 3 is safe.
 
 Decision:
-_to be filled in after enough log data has accumulated_
+  Option 1 (2026-05-14) — Keep them running. Revisit after the full pipeline is
+  stable and we have several months of all-zero logs across both step_2 and step_3.
 
 
 --------------------------------------------------------------------------
@@ -279,7 +405,10 @@ order swap for the rest. So most of the long tail is already gone —
 this entry is specifically about the boilerplate-sibling cases.
 
 Decision:
-_to be filled in after Krisztian discusses with his dad / client_
+  Resolved in phases. v0.18.0 (2026-05-14) forward protocol handles the primary
+  boilerplate-sibling shape: NO_PLAN siblings go to the plan manager via forward,
+  not into any strata folder. Front desk inbox stays clean. Sub-question (a)
+  (multi-PDF EMPTY siblings) remains open; (b) and (c) are now moot.
 
 
 --- 2026-05-14 addendum (0.15.0 regression + 0.15.1 partial fix) ---
@@ -325,6 +454,38 @@ Still open, for Krisztian to settle with his dad / client:
       boilerplate ignore list) is still open and unanswered — 0.15.1
       only undoes the accidental loosening, it does not pick an option.
 
+--- 2026-05-14 addendum (0.18.0 — forward protocol replaces strict-hold) ---
+
+0.18.0 changed the NO_PLAN sibling behaviour again. The strict-hold from 0.15.1
+is gone: a NO_PLAN PDF in a multi-attachment email is now SKIPPED in routing
+(not stamped, not filed), and the full original email (all attachments intact)
+is forwarded to the plan manager. After forwarding, the email moves to
+processed_emails. The front desk inbox stays clean.
+
+This resolves the practical workload problem: managers now receive boilerplate
+notices (FSC fuel surcharge sheets, payment-option flyers, etc.) directly in
+their inbox for safekeeping — without the front desk needing to act, and without
+the system mis-filing boilerplate as invoices.
+
+Sub-question status after 0.18.0:
+
+  (b) Front-desk recovery recipe — no longer relevant for the boilerplate-
+      sibling shape: the email no longer stays in the Inbox, so there is nothing
+      for the front desk to recover. A failed forward (e.g. missing manager email)
+      still flags in the Inbox; the recovery recipe there is the developer fixing
+      the Strataplan_List.xlsx entry, then letting Step 1 re-process via the next
+      run. No reply-to-self needed.
+
+  (c) The original Options 1-4 question (per-PDF rescue / known-boilerplate
+      ignore list) is now effectively moot for the boilerplate-sibling shape:
+      boilerplate goes to the manager via forward, not into any strata folder.
+      The only remaining open case is AMBIGUOUS PDFs in multi-attachment emails —
+      those still FLAG as before (AMBIGUOUS is not forwarded).
+
+  (a) Multi-PDF EMPTY siblings — still open. EMPTY in a multi-attachment email
+      routes-on-subject (same as pre-0.18.0). If that should instead forward to
+      manager like NO_PLAN, that's a one-line code change once decided.
+
 ### Technical references (hand these to a developer)
 
   - `steps/step_1_intake.py::_decide_email_action` — the matrix.
@@ -353,9 +514,11 @@ or a sibling sheet, NOT in code, so the operator can manage it without
 a deploy.
 
 Decision:
-_to be filled in after a few months of strict-first operational data —
-the daily log will show which vendors trigger clash-flags most often
-and which of those are false positives vs. genuine mis-labels_
+  Superseded by Decision 01 (2026-05-14). v0.16.0 implements PDF_OVERRIDE: when
+  the PDF text unambiguously identifies a directly-managed plan, the system routes
+  to that plan without flagging — universally, no per-vendor list needed. A per-
+  vendor whitelist can be revisited once we have months of operational data if
+  edge cases emerge.
 
 
 --------------------------------------------------------------------------
@@ -472,7 +635,11 @@ and shows up in tomorrow's summary. The operator needs a way to say
   Option 4.
 
 Decision:
-_to be filled in after Krisztian discusses with his dad / client_
+  Deferred (2026-05-14). The 4-field fingerprint (v0.9.2) already handles the
+  common re-bill case: a corrected amount changes the fingerprint so the re-bill
+  is not flagged as a duplicate. An Outlook-based front-desk gesture for the rare
+  edge case (same plan + invoice# + amount + domain, genuinely different invoice)
+  is open for a future sprint.
 
 
 ### Question 3 — Resolved 2026-05-12 (see ReleaseNotes.txt 0.9.2).
@@ -543,7 +710,9 @@ Probably acceptable since the manager catches it, but worth a check:
 how often do non-invoice PDFs actually show up in invoice emails?
 
 Decision:
-_to be filled in after Krisztian discusses with his dad / client_
+  Manager cleanup acceptable (2026-05-14). Cover letters and statements bundled
+  with real invoices land in the manager's To_Approve folder; the manager discards
+  them during review. No automation warranted at this time.
 
 
 ### Technical references (hand these to a developer)
@@ -600,7 +769,10 @@ same month.
              notices.
 
 Decision:
-_to be filled in after Krisztian discusses with his dad / client_
+  Option 1 (2026-05-14) — Keep the additive "(1)" file. Safe and reversible;
+  front desk decides whether to send both summaries to the board or discard one.
+  Anything that arrives after the month's summary was sent is processed for that
+  respective month regardless — no re-merging needed.
 
 
 ### Technical references (hand these to a developer)
@@ -653,7 +825,9 @@ and dumps the file into the Ambiguous bucket.
              check those manually.
 
 Decision:
-_to be filled in after Krisztian discusses with his dad / client_
+  Option 1 (2026-05-14) — Strict. "BCS 2707A" only counts for "BCS 2707A."
+  Implemented in v0.16.0: the double-scoring of the base plan was removed from
+  match_from_pdf_text, eliminating this class of avoidable flags.
 
 
 ### Question 2 — If a PDF says just "BCS 2707" but only "BCS 2707A" and "BCS 2707B" exist on the plan list, what should the FILENAME say?
@@ -682,7 +856,10 @@ ever said 2707.
              every time.
 
 Decision:
-_to be filled in after Krisztian discusses with his dad / client_
+  Option 3 (2026-05-14) — Flag for front-desk correction. When the PDF names only
+  a base plan and the list has only variants, the system flags and holds so the
+  front desk can confirm the correct variant. Implemented as AMBIGUOUS via
+  is_base_fallback in v0.16.0.
 
 
 ### Real-world cases to test against once you've decided

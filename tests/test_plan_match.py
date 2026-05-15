@@ -230,6 +230,61 @@ def test_find_explicit_plan_tokens() -> None:
         )
 
 
+def test_strict_suffix_matching() -> None:
+    """Decision 05 / Change C: a PDF mentioning 'BCS 2707A' must only score
+    BCS2707A, not also BCS2707. With both plans on the managed list, BCS2707A
+    should win cleanly (no spurious tie that would produce an AMBIGUOUS result).
+    """
+    rows = [
+        _row("BCS2707",  manager="Sue Smith"),
+        _row("BCS2707A", manager="Sue Smith"),
+        _row("BCS2707B", manager="Sue Smith"),
+    ]
+    text = "Invoice from ACME Corp. Strata Plan BCS 2707A. Total $250.00."
+    result = match_from_pdf_text(text, rows)
+    assert result.plan_norm == "BCS2707A", (
+        f"[strict suffix] PDF says BCS2707A, expected match=BCS2707A, got {result.plan_norm!r} "
+        f"(pre-fix double-count would tie BCS2707A with BCS2707 → ambiguous result)"
+    )
+    assert not result.is_base_fallback, (
+        f"[strict suffix] BCS2707A is a direct managed-list hit; is_base_fallback must be False"
+    )
+
+
+def test_base_fallback_sets_flag() -> None:
+    """Decision 04 / Change B: when the PDF says the base plan ('BCS 2707') but
+    the managed list only has suffix variants ('BCS 2707A', 'BCS 2707B'),
+    is_base_fallback must be True so the caller can flag for disambiguation.
+    Contrast: when the base plan itself IS on the managed list, is_base_fallback
+    must be False (direct hit).
+    """
+    rows_variants_only = [
+        _row("BCS2707A", manager="Sue Smith"),
+        _row("BCS2707B", manager="Sue Smith"),
+    ]
+    text = "Invoice from ACME Corp. Strata Plan BCS 2707. Total $250.00."
+    result = match_from_pdf_text(text, rows_variants_only)
+    assert result.plan_norm == "BCS2707", (
+        f"[base fallback] expected plan_norm=BCS2707 (base), got {result.plan_norm!r}"
+    )
+    assert result.is_base_fallback is True, (
+        f"[base fallback] expected is_base_fallback=True when only variants exist, got False"
+    )
+
+    # Contrast: base plan IS directly on the managed list → not a fallback.
+    rows_with_base = [
+        _row("BCS2707",  manager="Sue Smith"),
+        _row("BCS2707A", manager="Sue Smith"),
+    ]
+    result_direct = match_from_pdf_text(text, rows_with_base)
+    assert result_direct.plan_norm == "BCS2707", (
+        f"[direct base hit] expected plan_norm=BCS2707, got {result_direct.plan_norm!r}"
+    )
+    assert result_direct.is_base_fallback is False, (
+        f"[direct base hit] BCS2707 is directly on the list; is_base_fallback must be False"
+    )
+
+
 def test_plan_base() -> None:
     """Lock in plan_base behaviour: strip a single trailing letter.
 

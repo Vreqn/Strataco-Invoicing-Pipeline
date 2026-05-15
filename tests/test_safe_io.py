@@ -100,3 +100,20 @@ def test_safe_write_unique() -> None:
         assert e == root / "noext (1)" and e.read_bytes() == b"y", (
             f"[unique noext] expected {root / 'noext (1)'}, got {e}"
         )
+
+
+def test_safe_write_unique_retry_idempotent_on_collision_variant() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        target = root / "invoice.pdf"
+        safe_write_unique(target, b"first")
+        v1 = safe_write_unique(target, b"second")
+        assert v1 == root / "invoice (1).pdf"
+        # Retry with the same data already in (1) — must return (1), not create (2).
+        v1_retry = safe_write_unique(target, b"second")
+        assert v1_retry == root / "invoice (1).pdf", (
+            f"[retry collision] expected invoice (1).pdf, got {v1_retry}"
+        )
+        assert not (root / "invoice (2).pdf").exists(), (
+            "[retry collision] (2) was spuriously written"
+        )

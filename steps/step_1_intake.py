@@ -58,6 +58,7 @@ _STAMP = "step_1"
 
 _PROCESSED_FOLDER_NAME = "processed_emails"
 _DUPLICATE_FOLDER_NAME = "duplicate_emails"
+_ACTION_REQUIRED_FOLDER_NAME = "Action_Required"
 
 
 class RouteOutcome(enum.Enum):
@@ -82,13 +83,20 @@ class PdfOutcome(enum.Enum):
     - AMBIGUOUS: PDF text contains plan tokens but the matcher couldn't pick
       one safely — either an unmanaged plan number, or two equally-scored
       managed candidates. Don't trust either side; flag for review.
-    - CLASH: PDF confidently identifies a *different* plan than the subject.
+    - CLASH: PDF confidently identifies a *different* plan than the subject
+      (only produced by the filename-fallback path; the PDF-text path now
+      uses PDF_OVERRIDE instead).
+    - PDF_OVERRIDE: PDF text confidently identifies a *different* plan than
+      the subject AND the match is a direct managed-list hit (not a
+      base-without-suffix fallback). The PDF is trusted over the subject:
+      route to the PDF's plan rather than flagging.
     """
     AGREE = "agree"
     EMPTY = "empty"
     NO_PLAN = "no_plan"
     AMBIGUOUS = "ambiguous"
     CLASH = "clash"
+    PDF_OVERRIDE = "pdf_override"
 
 
 @dataclass
@@ -484,10 +492,27 @@ def _classify_pdf_against_subject(
     ) else None
 
     if confident_row is not None:
+        if result.is_base_fallback:
+            # PDF names the base plan (e.g. "BCS 2707") but the managed list only
+            # has suffix variants (e.g. "BCS 2707A", "BCS 2707B"). Can't determine
+            # which variant — flag for front-desk correction.
+            return PdfClassification(
+                outcome=PdfOutcome.AMBIGUOUS,
+                base_name=base_name,
+                blob=blob,
+                pdf_plan_norm=confident_row.plan_norm,
+                pdf_plan_row=confident_row,
+                note=(
+                    f"PDF identifies base plan "
+                    f"{plan_match.pretty_plan(confident_row.plan_norm)} only; "
+                    f"variant is ambiguous — flagged for front-desk correction."
+                ),
+                detected=result.detected,
+            )
         if confident_row.plan_norm == subject_plan_norm:
             outcome = PdfOutcome.AGREE
         else:
-            outcome = PdfOutcome.CLASH
+            outcome = PdfOutcome.PDF_OVERRIDE
         return PdfClassification(
             outcome=outcome,
             base_name=base_name,
@@ -574,9 +599,10 @@ def _decide_email_action(
 
       - all AGREE                             → ROUTE_AS_SUBJECT
       - lone PDF, EMPTY or NO_PLAN            → ROUTE_AS_SUBJECT
-      - multi-PDF, any NO_PLAN                → FLAG (can't tell a plan-less
-                                                invoice from a plan-less
-                                                boilerplate notice)
+      - multi-PDF, any NO_PLAN                → ROUTE_AS_SUBJECT (NO_PLAN PDFs
+                                                are skipped in the routing loop;
+                                                caller forwards the email to the
+                                                manager so they see the extras)
       - any AMBIGUOUS                         → FLAG (strict-first)
       - any EMPTY/NO_PLAN mixed with any CLASH → FLAG (can't safely route it)
       - all PDFs confident, ≥1 CLASH:
@@ -588,14 +614,14 @@ def _decide_email_action(
       * "Confident" here means the PDF returned an active plan with a manager
         (PdfOutcome.AGREE or PdfOutcome.CLASH). EMPTY, NO_PLAN, and AMBIGUOUS
         are not confident.
-      * EMPTY always routes on the subject. NO_PLAN routes on the subject
-        only as the lone PDF; a NO_PLAN sibling in a multi-PDF email flags
-        the whole email — we can't tell a plan-less real invoice from a
-        plan-less boilerplate notice the vendor stapled on.
-      * The base-collision check covers the subject's plan implicitly: if a
-        PDF's plan AGREES, its plan_norm equals subject_plan_norm, and that
-        plan appears in `unique_plans`, so the base check catches a "subject
-        plan and another PDF plan share a base" scenario too.
+      * EMPTY and NO_PLAN both route on the subject (lone or multi-PDF). In a
+        multi-PDF email a NO_PLAN PDF is not stamped or routed — the caller
+        skips it in the routing loop and forwards the whole email to the plan
+        manager instead. The base-collision check covers the subject's plan
+        implicitly: if a PDF's plan AGREES, its plan_norm equals
+        subject_plan_norm, and that plan appears in `unique_plans`, so the
+        base check catches a "subject plan and another PDF plan share a base"
+        scenario too.
     """
     if not classifications:
         # No PDFs at all — degenerate but possible if caller passed a zip-only
@@ -605,35 +631,72 @@ def _decide_email_action(
 
     outcomes = [c.outcome for c in classifications]
 
-    if all(
-        o in (PdfOutcome.AGREE, PdfOutcome.EMPTY, PdfOutcome.NO_PLAN)
-        for o in outcomes
-    ):
-        agreed = sum(1 for o in outcomes if o == PdfOutcome.AGREE)
-        empty = sum(1 for o in outcomes if o == PdfOutcome.EMPTY)
-        no_plan = sum(1 for o in outcomes if o == PdfOutcome.NO_PLAN)
-        # NO_PLAN routes on the subject only when it's the *lone* PDF — the
-        # genuine "vendor invoice that never prints the plan number" case. In a
-        # multi-PDF email a NO_PLAN sibling hasn't cleared the dual-factor bar:
-        # we can't tell a plan-less real invoice from a plan-less boilerplate
-        # notice the vendor stapled on. Hold the whole email for the front desk
-        # rather than stamping and filing a guess. (Regression guard: 0.15.0
-        # routed these on the subject and silently filed FSC_Fuel_Surcharge_.pdf
-        # as a BCS 3396 invoice — 2026-05-14 incident.)
-        if len(classifications) > 1 and no_plan:
-            no_plan_names = [
-                c.base_name for c in classifications
-                if c.outcome == PdfOutcome.NO_PLAN
-            ]
+    _CLEAN_OUTCOMES = frozenset({
+        PdfOutcome.AGREE, PdfOutcome.EMPTY, PdfOutcome.NO_PLAN, PdfOutcome.PDF_OVERRIDE,
+    })
+
+    if all(o in _CLEAN_OUTCOMES for o in outcomes):
+        overridden = [c for c in classifications if c.outcome == PdfOutcome.PDF_OVERRIDE]
+
+        if not overridden:
+            # All AGREE / EMPTY / NO_PLAN — existing behaviour.
+            agreed = sum(1 for o in outcomes if o == PdfOutcome.AGREE)
+            empty = sum(1 for o in outcomes if o == PdfOutcome.EMPTY)
+            no_plan = sum(1 for o in outcomes if o == PdfOutcome.NO_PLAN)
+            return EmailAction(
+                EmailActionKind.ROUTE_AS_SUBJECT,
+                f"PDF cross-check OK ({agreed} agree, {empty} empty, "
+                f"{no_plan} no plan # in PDF — routed under subject)",
+            )
+
+        # At least one PDF_OVERRIDE (PDF trusted over subject).
+        # Check for suffix-variant ambiguity among the confident PDFs first.
+        confident_pdfs = [
+            c for c in classifications
+            if c.outcome in (PdfOutcome.AGREE, PdfOutcome.PDF_OVERRIDE)
+        ]
+        unique_plans = sorted({c.pdf_plan_norm for c in confident_pdfs})
+        bases = [plan_match.plan_base(p) for p in unique_plans]
+        if len(set(bases)) < len(unique_plans):
+            plan_summary = ", ".join(plan_match.pretty_plan(p) for p in unique_plans)
             return EmailAction(
                 EmailActionKind.FLAG_AND_HOLD,
-                f"multi-PDF email with PDF(s) carrying no plan number: "
-                f"{', '.join(no_plan_names)} — held for front-desk review",
+                f"suffix-variant clash across PDFs: {plan_summary} share a base",
             )
+
+        # Build per_pdf_plan for every confident PDF so the routing loop uses
+        # the right plan_row regardless of action.kind.
+        per_pdf_plan: dict[int, PlanRow] = {}
+        for idx, c in enumerate(classifications):
+            if c.outcome in (PdfOutcome.AGREE, PdfOutcome.PDF_OVERRIDE):
+                if c.pdf_plan_row is None:
+                    return EmailAction(
+                        EmailActionKind.FLAG_AND_HOLD,
+                        f"internal: missing pdf_plan_row for {c.base_name} "
+                        f"during PDF-override routing — flagging instead of risking misroute",
+                    )
+                per_pdf_plan[idx] = c.pdf_plan_row
+
+        if len(unique_plans) <= 1:
+            # All confident PDFs agree on one plan (the PDF's plan).
+            plan_label = (
+                plan_match.pretty_plan(unique_plans[0]) if unique_plans
+                else plan_match.pretty_plan(subject_plan_norm)
+            )
+            return EmailAction(
+                EmailActionKind.ROUTE_AS_SUBJECT,
+                f"PDF overrides subject: routing to {plan_label} (PDF evidence trusted)",
+                per_pdf_plan=per_pdf_plan,
+            )
+
+        # Multiple distinct-base plans across confident PDFs — AUTO_SPLIT.
+        plan_summary = ", ".join(plan_match.pretty_plan(p) for p in unique_plans)
         return EmailAction(
-            EmailActionKind.ROUTE_AS_SUBJECT,
-            f"PDF cross-check OK ({agreed} agree, {empty} empty, "
-            f"{no_plan} no plan # in PDF — routed under subject)",
+            EmailActionKind.AUTO_SPLIT,
+            f"auto-split across distinct strata bases: {plan_summary} "
+            f"(PDF evidence trusted; subject {plan_match.pretty_plan(subject_plan_norm)} "
+            f"may be partial)",
+            per_pdf_plan=per_pdf_plan,
         )
 
     if any(o == PdfOutcome.AMBIGUOUS for o in outcomes):
@@ -745,6 +808,8 @@ def main() -> int:
             run.error(f"failed to list inbox messages: {exc}")
             return 1
         run.info(f"fetched {len(messages)} inbox messages")
+        initial_inbox_ids: set[str] = {str(m.get("id") or "") for m in messages}
+        initial_inbox_ids.discard("")
 
         processed_folder_id = graph.find_child_folder_id("Inbox", _PROCESSED_FOLDER_NAME)
         if not processed_folder_id:
@@ -759,6 +824,13 @@ def main() -> int:
                 f"Inbox subfolder '{_DUPLICATE_FOLDER_NAME}' not found — "
                 f"create it and re-run. Duplicate emails will stay in Inbox "
                 f"until then; ledger still updates."
+            )
+
+        action_required_folder_id = graph.find_child_folder_id("Inbox", _ACTION_REQUIRED_FOLDER_NAME)
+        if not action_required_folder_id:
+            run.warn(
+                f"Inbox subfolder '{_ACTION_REQUIRED_FOLDER_NAME}' not found — "
+                f"create it in OWA and re-run. Inbox sweep will be skipped."
             )
 
         # Duplicate-detection ledger — loaded once at startup, mutated in
@@ -1005,7 +1077,38 @@ def main() -> int:
                 if subject:
                     run.info(f"skip: '{subject[:60]}' — no plan match, no attachments")
 
+        if action_required_folder_id:
+            _sweep_inbox_to_action_required(action_required_folder_id, run, initial_inbox_ids)
+
     return 0
+
+
+def _sweep_inbox_to_action_required(folder_id: str, run, initial_ids: set[str]) -> int:
+    """Move every originally-fetched Inbox message still present to Action_Required.
+
+    Uses a re-fetch so messages already moved during the processing loop are
+    naturally absent. Filters to `initial_ids` so emails that arrived after
+    the initial fetch are left in the Inbox root for the next run.
+    Returns the number successfully moved.
+    """
+    try:
+        remaining = graph.list_inbox_messages(top=500)
+    except Exception as exc:
+        run.error(f"sweep: failed to list inbox messages: {exc}")
+        return 0
+    moved = 0
+    for msg in remaining:
+        msg_id = msg.get("id") or ""
+        if not msg_id or msg_id not in initial_ids:
+            continue  # new arrival or blank id — leave it for the next run
+        try:
+            graph.move_message_to_folder(msg_id, folder_id)
+            moved += 1
+        except Exception as exc:
+            subject_preview = str(msg.get("subject") or "")[:60]
+            run.error(f"sweep: failed to move '{subject_preview}' → Action_Required: {exc}")
+    run.info(f"sweep: {moved} inbox message(s) → Action_Required")
+    return moved
 
 
 def _email_destination(
@@ -1073,14 +1176,18 @@ def _process_self_attachments(
     """Matched email with its own attachments — cross-validate, then stamp/route or flag.
 
     Flow:
-      1. List + filter attachments.
+      1. List + filter attachments. Track any non-PDF/ZIP that gets discarded.
       2. For each PDF: download the bytes and classify against the subject's plan.
          For non-PDFs: defer (still get parked in _Unmatched/ on route paths).
       3. Decide an email-level action via `_decide_email_action`.
-         - ROUTE_AS_SUBJECT: stamp every PDF with the subject's plan (legacy path).
+         - ROUTE_AS_SUBJECT: stamp every AGREE/EMPTY PDF with the subject's plan.
+           NO_PLAN PDFs in a multi-attachment email are skipped (not stamped).
          - AUTO_SPLIT: stamp each PDF with its own PDF-detected plan; subject ignored.
          - FLAG_AND_HOLD: set Outlook to-do flag, write nothing to disk, leave the
            email in the Inbox so the operator's red-flag review surfaces it.
+      4. If extras were present (discarded non-PDFs or NO_PLAN PDF siblings) and
+         routing had no failures, forward the full original email to the plan
+         manager and move to processed_emails.
     """
     try:
         attachments = graph.list_attachments(msg_id)
@@ -1104,6 +1211,7 @@ def _process_self_attachments(
     # orphan entry in `To-Speak-About.txt`.
     pdf_atts: list[tuple[dict, str]] = []   # (att, base_name)
     zip_atts: list[tuple[dict, str]] = []   # (att, base_name)
+    has_non_pdf_extras = False
     for a in kept:
         ext = _ext_for_attachment(a, subject)
         base_name = str(a.get("name") or "file").strip() or "file"
@@ -1117,6 +1225,7 @@ def _process_self_attachments(
         else:
             ct = str(a.get("contentType") or "").strip() or "unknown"
             run.info(f"discarded non-PDF/ZIP attachment: '{base_name}' ({ct})")
+            has_non_pdf_extras = True
 
     # Pass 2a: download + classify every top-level PDF. Any download failure
     # flags the whole email — we can't make a safe routing decision without
@@ -1203,6 +1312,15 @@ def _process_self_attachments(
         _flag_message_safely(msg_id, subject, run)
         return
 
+    # A NO_PLAN PDF in a multi-attachment email is an "extra" — it isn't an
+    # invoice we can stamp and file, so it stays in the original email which
+    # gets forwarded to the manager. A lone NO_PLAN PDF routes on the subject
+    # (vendor invoice without a plan number in the PDF) and is not an extra.
+    has_no_plan_pdf = (
+        any(c.outcome == PdfOutcome.NO_PLAN for c in classifications)
+        and len(classifications) > 1
+    )
+
     # Pass 3: decide.
     action = _decide_email_action(plan_row.plan_norm, classifications)
 
@@ -1222,9 +1340,18 @@ def _process_self_attachments(
     outcomes: list[RouteOutcome] = []
 
     for idx, c in enumerate(classifications):
+        if c.outcome == PdfOutcome.NO_PLAN and len(classifications) > 1:
+            # Multi-attachment email: NO_PLAN PDFs are not routed here.
+            # The whole email is forwarded to the manager (see below) so
+            # they can decide what to do with the plan-less attachment.
+            run.info(f"skip routing NO_PLAN PDF '{c.base_name}' — forwarding email to manager")
+            continue
         if action.kind == EmailActionKind.AUTO_SPLIT:
             target_row = action.per_pdf_plan[idx]
             route_source = "pdf_text (auto-split)"
+        elif idx in action.per_pdf_plan:
+            target_row = action.per_pdf_plan[idx]
+            route_source = "pdf_text (override)"
         else:
             target_row = plan_row
             route_source = match_source
@@ -1267,7 +1394,68 @@ def _process_self_attachments(
         )
         _flag_message_safely(msg_id, subject, run)
 
-    target_folder_id = _email_destination(outcomes, processed_folder_id, duplicate_folder_id)
+    # Forward the original email (with all attachments) to the plan manager
+    # when the email contained extras — non-invoice non-PDF files discarded
+    # in Pass 1, or plan-less PDF siblings that weren't routed above. The
+    # manager can see everything that came in and decide what to save.
+    # Only fires when routing had no failures (a partial-commit flag already
+    # signals the operator; no need to also forward an incomplete email).
+    forward_needed = has_non_pdf_extras or has_no_plan_pdf
+    forwarded = False
+    forward_blocked = False  # True when forward was needed but couldn't be delivered
+    if forward_needed and not any(o == RouteOutcome.FAILED for o in outcomes):
+        # Collect unique (email, name) targets. AUTO_SPLIT, PDF_OVERRIDE with
+        # per_pdf_plan, and plain ROUTE_AS_SUBJECT all share this path.
+        if action.per_pdf_plan:
+            seen_fwd: set[str] = set()
+            fwd_targets: list[tuple[str, str]] = []
+            for split_row in action.per_pdf_plan.values():
+                if split_row and split_row.manager_email and split_row.manager_email not in seen_fwd:
+                    seen_fwd.add(split_row.manager_email)
+                    fwd_targets.append((split_row.manager_email, split_row.strata_name))
+        else:
+            fwd_targets = (
+                [(plan_row.manager_email, plan_row.strata_name)]
+                if plan_row.manager_email else []
+            )
+
+        if not fwd_targets:
+            run.warn(
+                f"FORWARD_SKIPPED: no manager email for "
+                f"{plan_match.pretty_plan(plan_row.plan_norm)} — extras not forwarded"
+            )
+            forward_blocked = True
+        else:
+            any_fwd_ok = False
+            for fwd_email, fwd_name in fwd_targets:
+                try:
+                    fwd_comment = (
+                        f"The invoice for {fwd_name} has been filed automatically. "
+                        f"The original email contained additional attachments — "
+                        f"forwarding for your review."
+                    )
+                    graph.forward_message(msg_id, graph.resolve_recipient(fwd_email), fwd_comment)
+                    run.info(f"FORWARDED_TO_MANAGER: {fwd_email} — extras present alongside invoice")
+                    any_fwd_ok = True
+                except Exception as exc:
+                    run.error(f"forward_to_manager failed for '{subject[:50]}': {exc}")
+                    forward_blocked = True
+            if any_fwd_ok and not forward_blocked:
+                forwarded = True
+
+    # forward_blocked: extras needed forwarding but couldn't be delivered (Graph
+    # error or no manager email on record). Keep the email in the Inbox with a
+    # red flag so the operator can see the extras and action them manually.
+    # This takes priority over the normal destination logic.
+    if forward_blocked:
+        _flag_message_safely(msg_id, subject, run)
+        target_folder_id = None
+    elif forwarded:
+        # Forwarded successfully: always processed (covers all-NO_PLAN edge case
+        # where outcomes is empty and _email_destination would return None).
+        target_folder_id = processed_folder_id
+    else:
+        target_folder_id = _email_destination(outcomes, processed_folder_id, duplicate_folder_id)
     if target_folder_id is not None:
         try:
             graph.move_message_to_folder(msg_id, target_folder_id)
@@ -1380,9 +1568,20 @@ def _process_prior_attachments(
     # ROUTE_AS_SUBJECT or AUTO_SPLIT.
     outcomes: list[RouteOutcome] = []
     for idx, c in enumerate(classifications):
+        # Mirror the self-attachment guard: skip plan-less PDFs in multi-PDF
+        # priors so boilerplate siblings aren't stamped and filed as invoices.
+        if c.outcome == PdfOutcome.NO_PLAN and len(classifications) > 1:
+            run.info(
+                f"skip routing NO_PLAN PDF '{c.base_name}' in prior "
+                f"(source msg {prior_msg_id[:12]}...) — not an invoice"
+            )
+            continue
         if action.kind == EmailActionKind.AUTO_SPLIT:
             target_row = action.per_pdf_plan[idx]
             route_label = "conversation-link (auto-split)"
+        elif idx in action.per_pdf_plan:
+            target_row = action.per_pdf_plan[idx]
+            route_label = "conversation-link (pdf_text override on prior)"
         else:
             target_row = plan_row
             route_label = f"conversation-link ({match_source} match on reply)"
@@ -1405,6 +1604,43 @@ def _process_prior_attachments(
                 f"{route_label} duplicate: {c.base_name} already in pipeline "
                 f"(source msg {prior_msg_id[:12]}...)"
             )
+
+    # Forward the prior email to the plan manager when a NO_PLAN sibling was
+    # skipped — mirrors the has_no_plan_pdf forward block in
+    # _process_self_attachments so managers see all attachments that arrived.
+    has_no_plan_prior_pdf = (
+        any(c.outcome == PdfOutcome.NO_PLAN for c in classifications)
+        and len(classifications) > 1
+    )
+    if has_no_plan_prior_pdf and not any(o == RouteOutcome.FAILED for o in outcomes):
+        if action.per_pdf_plan:
+            seen_fwd: set[str] = set()
+            fwd_targets: list[tuple[str, str]] = []
+            for r in action.per_pdf_plan.values():
+                if r and r.manager_email and r.manager_email not in seen_fwd:
+                    seen_fwd.add(r.manager_email)
+                    fwd_targets.append((r.manager_email, r.strata_name))
+        else:
+            fwd_targets = (
+                [(plan_row.manager_email, plan_row.strata_name)]
+                if plan_row.manager_email else []
+            )
+        for fwd_email, fwd_name in fwd_targets:
+            try:
+                comment = (
+                    f"The invoice for {fwd_name} has been filed automatically. "
+                    f"The original email contained additional attachments — "
+                    f"forwarding for your review."
+                )
+                graph.forward_message(prior_msg_id, graph.resolve_recipient(fwd_email), comment)
+                run.info(
+                    f"FORWARDED_TO_MANAGER: {fwd_email} — "
+                    f"NO_PLAN sibling in prior (source msg {prior_msg_id[:12]}...)"
+                )
+            except Exception as exc:
+                run.error(
+                    f"forward_to_manager (prior) failed for '{reply_subject[:50]}': {exc}"
+                )
 
     return PriorProcessingResult(outcomes=outcomes)
 

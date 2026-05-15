@@ -173,11 +173,12 @@ Maintain the deploy machine, the Strataplan list, and the Azure registration.
    | `NOTIFY_DEFAULT_EMAIL` | The real recipient for the daily Step 6 "Invoices summary" email (e.g. the AP supervisor). Required — Step 6 raises at startup if neither this nor `NOTIFY_OVERRIDE_EMAIL` is set. |
    | `NOTIFY_OVERRIDE_EMAIL` | All notification emails are rerouted here during the shadow phase. Set to empty when going live to send to real managers/APs. |
 
-5. **Create two Inbox subfolders** in OWA for the mailbox in `MAILBOX_UPN`. Both are **required** — skip this and the pipeline runs but leaves emails sitting in the Inbox until you come back to fix it.
-   - `processed_emails` — Step 1 moves handled emails here.
+5. **Create three Inbox subfolders** in OWA for the mailbox in `MAILBOX_UPN`. All three are **required** — skip any and the relevant Step 1 behaviour is degraded until you create it.
+   - `processed_emails` — Step 1 moves successfully handled emails here.
    - `duplicate_emails` — Step 1 moves emails whose attachments were all duplicates here. **Added in 0.9.0** — verify this folder exists when you upgrade.
+   - `Action_Required` — Step 1 sweeps all remaining inbox emails here at the end of each run (unmatched, flagged, general correspondence). This is the front desk's daily work queue. **Added in 0.16.0.**
 
-   To create each: in OWA, right-click `Inbox` → `Create new subfolder` → type the exact name above (lowercase, with underscore). Verify both folders appear under Inbox before running Step 1.
+   To create each: in OWA, right-click `Inbox` → `Create new subfolder` → type the exact name above (case-sensitive, with underscore). Verify all three folders appear under Inbox before running Step 1.
 
 6. **Verify everything boots:**
    ```
@@ -357,6 +358,9 @@ If a future SSH-key migration ever happens, this section needs updating — but 
 
 **"Inbox subfolder 'duplicate_emails' not found"**
 → Create it in OWA under Inbox. Until then, duplicates are still detected (ledger updates and dup_count increments), but the email itself stays in the Inbox.
+
+**"Inbox subfolder 'Action_Required' not found" (warning in log)**
+→ Create it in OWA under Inbox (exact name: `Action_Required`, capital A and R, underscore). Until then the end-of-run inbox sweep is skipped and unhandled emails remain in the main Inbox.
 
 **A duplicate was flagged but it's actually a new invoice**
 → Vendor re-issued the invoice (credit and rebill, corrected version). Find the sha256 prefix in the duplicate-summary email or in the step log (`duplicate skipped: <name> (sha=<short>...)`) and run:

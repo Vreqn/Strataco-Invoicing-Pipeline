@@ -109,8 +109,12 @@ def _fake_daily_log(captured: dict):
     run.status = "error" if run.errors else "ok"
 
 
-def _find_child_folder_id(_parent: str, name: str) -> str:
-    return _PROCESSED_FOLDER if name == "processed_emails" else _DUP_FOLDER
+def _find_child_folder_id(_parent: str, name: str) -> str | None:
+    if name == "processed_emails":
+        return _PROCESSED_FOLDER
+    if name == "duplicate_emails":
+        return _DUP_FOLDER
+    return None  # Action_Required and others → sweep skipped in these tests
 
 
 def _make_move(fail_first: dict[str, int] | None = None):

@@ -147,6 +147,14 @@ def safe_write_unique(path: Path, data: bytes) -> Path:
     if not path.exists():
         atomic_write_bytes(path, data)
         return path
+    # Idempotent retry: same content already at the target — return it in-place
+    # rather than creating a collision copy. A different-content file at path
+    # falls through to the collision-rename loop below.
+    try:
+        if path.read_bytes() == data:
+            return path
+    except OSError:
+        pass
     stem = path.stem
     suffix = path.suffix
     parent = path.parent
@@ -156,4 +164,9 @@ def safe_write_unique(path: Path, data: bytes) -> Path:
         if not candidate.exists():
             atomic_write_bytes(candidate, data)
             return candidate
+        try:
+            if candidate.read_bytes() == data:
+                return candidate
+        except OSError:
+            pass
         counter += 1

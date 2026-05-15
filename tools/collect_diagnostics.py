@@ -88,6 +88,42 @@ def _iso(ts: float) -> str:
     return _dt.datetime.fromtimestamp(ts).isoformat(timespec="seconds")
 
 
+def _lock_is_held(lockfile: Path) -> bool:
+    """Whether a `.step_N.lock` is *actively* held by a live run.
+
+    The lockfile persists on disk after a run — portalocker releases the
+    OS lock but does not unlink the file — so `.exists()` alone is not
+    "held". Probe with a non-blocking exclusive acquire: if we get it,
+    nothing holds it (release immediately, report free); a LockException
+    means a run genuinely holds it. The probe holds the lock for only
+    microseconds, and `daily_log` now retries acquisition for a few
+    seconds (LOCK_ACQUIRE_TIMEOUT_S) before declaring a run skipped — so
+    a probe landing mid-startup no longer manufactures a skipped run.
+    """
+    if not lockfile.exists():
+        return False
+    try:
+        import portalocker
+    except Exception:
+        return False
+    try:
+        lock = portalocker.Lock(
+            str(lockfile),
+            mode="a",
+            timeout=0,
+            flags=portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING,
+        )
+        lock.acquire()
+        lock.release()
+        return False
+    except portalocker.exceptions.LockException:
+        return True
+    except Exception:
+        # Perms or other error — don't claim held; existence-only would be
+        # a regression to the false alarm this probe exists to fix.
+        return False
+
+
 def _listing_tsv(folder: Path, root: Path, recursive: bool = False) -> str:
     """Build a TSV of files in `folder`, paths reported relative to `root`."""
     lines = [TSV_HEADER.rstrip("\n")]
@@ -276,7 +312,7 @@ def _build_summary(
     out.append("\n## Lockfiles\n")
     if lock_status:
         for step, held in lock_status.items():
-            out.append(f"- {step}: {'**HELD** (process may still be running, or stale lockfile)' if held else 'free'}\n")
+            out.append(f"- {step}: {'**HELD** (a run is currently active)' if held else 'free'}\n")
     else:
         out.append("- log_dir not present; cannot inspect lockfiles.\n")
 
@@ -476,7 +512,7 @@ def _build_zip(
                 except OSError:
                     continue
         for step in STEPS:
-            lock_status[step] = (log_dir / f".{step}.lock").exists()
+            lock_status[step] = _lock_is_held(log_dir / f".{step}.lock")
 
     log_tails: dict[str, str] = {}
     today = _today_iso()
@@ -493,7 +529,7 @@ def _build_zip(
     if any(lock_status.values()):
         for step, held in lock_status.items():
             if held:
-                pointers.append(f"`{step}` lockfile is held — either a run is still active or a previous run crashed.")
+                pointers.append(f"`{step}` lock is held — a run is currently active.")
 
     env_text = _env_report()
     system_text = _system_report()

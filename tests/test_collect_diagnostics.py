@@ -263,6 +263,38 @@ def test_no_strataplan_flag() -> None:
         )
 
 
+def test_lock_is_held_probe() -> None:
+    """A .step_N.lock file persists on disk after a run; existence alone is
+    not 'held'. _lock_is_held must probe the actual OS lock: a stale
+    (unlocked) file reports free, a file held by a live lock reports held.
+    """
+    import portalocker
+
+    if "tools.collect_diagnostics" in sys.modules:
+        del sys.modules["tools.collect_diagnostics"]
+    cd = importlib.import_module("tools.collect_diagnostics")
+
+    with tempfile.TemporaryDirectory() as td:
+        missing = Path(td) / ".step_6.lock"
+        assert cd._lock_is_held(missing) is False, "missing file -> not held"
+
+        stale = Path(td) / ".step_5.lock"
+        stale.write_text("")  # exists but nothing holds it
+        assert cd._lock_is_held(stale) is False, "stale unlocked file -> not held"
+
+        held = Path(td) / ".step_1.lock"
+        lock = portalocker.Lock(
+            str(held), mode="a", timeout=0,
+            flags=portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING,
+        )
+        lock.acquire()
+        try:
+            assert cd._lock_is_held(held) is True, "actively held lock -> held"
+        finally:
+            lock.release()
+        assert cd._lock_is_held(held) is False, "after release -> not held"
+
+
 def test_missing_strataco_root() -> None:
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         out = Path(td) / "bundle.zip"

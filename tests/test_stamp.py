@@ -46,8 +46,10 @@ from tools._lib.stamp import (
     _normalize_token,
     find_largest_whitespace_box,
     flatten_acroform,
+    render_paid_stamp,
     render_received_stamp,
 )
+from pypdf import PdfReader
 
 
 LETTER_W_PT, LETTER_H_PT = LETTER
@@ -311,6 +313,28 @@ def test_clean_invoice_unchanged():
     _assert_placement_avoids_all_bands(placement, bands, label="[clean] ")
 
 
+def test_paid_stamp_date_field_shows_format_hint():
+    """The Paid stamp's Date field carries a visible format hint so whoever
+    fills it knows the expected format. The editable AcroForm Date field
+    must survive, and the Received stamp (different code path) stays
+    hint-free.
+    """
+    invoice = _build_clean_invoice()
+    paid_pdf = render_paid_stamp(invoice)
+
+    reader = PdfReader(io.BytesIO(paid_pdf))
+    fields = reader.get_fields() or {}
+    date_fields = [n for n in fields if n.startswith("paid_date_")]
+    assert len(date_fields) == 1, f"one editable paid_date field: got {list(fields)}"
+
+    page_text = reader.pages[0].extract_text() or ""
+    assert "MMM DD YYYY" in page_text, f"hint not on Paid stamp page: {page_text!r}"
+
+    received_pdf = render_received_stamp(invoice, "MAY 12 2026", "BCS 2707")
+    received_text = PdfReader(io.BytesIO(received_pdf)).pages[0].extract_text() or ""
+    assert "MMM DD YYYY" not in received_text, "hint leaked onto Received stamp"
+
+
 def test_paid_stamp_after_received_avoids_totals():
     """End-to-end: apply Received, flatten, then compute Paid placement.
     Neither stamp's rectangle may overlap the totals / invoice# rows.
@@ -337,4 +361,34 @@ def test_paid_stamp_after_received_avoids_totals():
     # should match the totals or invoice-number label sets.
     _assert_placement_avoids_all_bands(
         paid_placement, bands_after, label="[paid] "
+    )
+
+
+def test_stamp_determinism_with_sha_seed():
+    """render_received_stamp and render_paid_stamp must produce byte-identical
+    output on repeated calls when given the same source PDF and the same SHA
+    seed. This is the gate test for the 0.17.2 idempotency fix: if any PDF
+    library introduces non-deterministic output (random /ID, timestamp) this
+    test will catch it before the safe_write_unique content-equality check is
+    relied upon in production.
+    """
+    invoice = _build_invoice_with_totals_lower_right()
+    sha_seed = "a" * 64  # fixed fake SHA
+
+    # render_received_stamp — two independent calls must be byte-identical
+    stamped_a = render_received_stamp(invoice, "MAY 14 2026", "BCS 2707", sha=sha_seed)
+    stamped_b = render_received_stamp(invoice, "MAY 14 2026", "BCS 2707", sha=sha_seed)
+    assert stamped_a == stamped_b, (
+        "render_received_stamp output is non-deterministic with the same SHA seed — "
+        "content-idempotency in safe_write_unique will silently fail on retry. "
+        "Fix the PDF library randomness before shipping 0.17.2."
+    )
+
+    # render_paid_stamp on the flattened received stamp — same requirement
+    flat = flatten_acroform(stamped_a)
+    paid_a = render_paid_stamp(flat, sha=sha_seed)
+    paid_b = render_paid_stamp(flat, sha=sha_seed)
+    assert paid_a == paid_b, (
+        "render_paid_stamp output is non-deterministic with the same SHA seed — "
+        "same fix required."
     )

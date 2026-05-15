@@ -1,23 +1,19 @@
-"""Step 6 — Archive paid invoices into the Strata Plan folder.
-
-Replaces "Step 6 - Accounting - Move Paid Invoices to Strata Plan folders"
-(N8n) with the behavioural changes from `Things to Change to current Flows.txt`:
-
-1. Drop the `Paid -` filename filter — process every PDF in the AP's
-   Paid_Invoices folder (skip files starting with `Processed -` and skip
-   files whose `Processed - <name>` counterpart already exists).
-2. When copying to `Strata_Plans/<plan>/`, open the PDF, read the Check
-   Number from the (flattened) Paid stamp, and prefix the destination
-   filename with that check number.
+"""Step 6 — Move paid invoices into the Strata Plan archive folder.
 
 For each unique AP:
   - List PDFs in Paid_Invoices
-  - Skip Processed- and files whose Processed counterpart already exists
+  - Skip files starting with `Processed -` (legacy markers, left by earlier
+    pipeline versions; harmless, but never pipeline content)
   - Extract Strata Plan from filename
   - Look up Strata Plan folder in the XLS
-  - Read the Check Number from the flat PDF text
-  - atomic-write to Strata_Plans/<plan>/<check_number> - <original>.pdf
-  - Write `Processed - <original>.pdf` back to AP's Paid_Invoices
+  - Read the Check Number and Date from the (AcroForm) Paid stamp
+  - Flatten the AcroForm, atomic-write to
+    Strata_Plans/<plan>/<check_number> - <MM> - <plan> <Month> <YYYY> inv.pdf
+  - Update the dup-ledger to stage "archived"
+  - Delete the source from Paid_Invoices (true move — no Processed- marker)
+
+Dedup is provided by the dup-ledger (SHA-256 keyed). A failed ledger write
+keeps the source in place for retry on the next run (fail-closed).
 
 Send one daily "Invoices summary" email covering processed, unmatched, and
 duplicate sections — always sent so a silent inbox means the cron did not
@@ -93,10 +89,6 @@ class _ScanResult:
     errors: list[str] = field(default_factory=list)
 
 
-def _processed_counterpart(name: str) -> str:
-    """`Paid - foo.pdf` -> `Processed - Paid - foo.pdf`."""
-    return f"Processed - {name}"
-
 
 def _build_archive_name(
     check_number: str,
@@ -123,6 +115,23 @@ def _is_processed(name: str) -> bool:
     return n.startswith("processed -") or n.startswith("processed-")
 
 
+def _is_os_junk(name: str) -> bool:
+    """OS-generated metadata files that are never pipeline content:
+    .DS_Store and AppleDouble sidecars (macOS), Thumbs.db / desktop.ini
+    (Windows). They reach shared folders via file-server browsing and
+    must never be reported as 'stuck intake'.
+
+    Scoped to these exact names — a genuinely stuck intake file that
+    happens to be dot-hidden must still surface in the morning report,
+    so this does NOT filter all dotfiles."""
+    n = name.strip().lower()
+    return (
+        n == ".ds_store"
+        or n.startswith("._")          # AppleDouble sidecars
+        or n in {"thumbs.db", "desktop.ini"}
+    )
+
+
 def _archive_one(
     pdf_path: Path,
     plan_to_path: dict[str, PlanRow],
@@ -135,7 +144,75 @@ def _archive_one(
     local_path = str(pdf_path)
     mtime_iso = _format_mtime(pdf_path)
 
-    plan_raw_from_file, plan_norm = plan_match.plan_from_filename(name)
+    try:
+        pdf_bytes = pdf_path.read_bytes()
+    except Exception as exc:
+        run.error(f"read {pdf_path}: {exc}")
+        return
+
+    # `sha` is the chain SHA computed on the AP-folder bytes (pre-flatten).
+    # `archive_sha256` is set later to the post-flatten bytes.
+    sha = dup_fingerprint.sha256_of(pdf_bytes)
+
+    # Ledger pre-check: if this PDF was already archived (e.g. a prior run
+    # wrote the archive and deleted the source, then the source somehow
+    # reappeared), clean it up without re-archiving — but only after verifying
+    # the archive file's content matches the stored SHA256. Trusting path
+    # existence alone could delete the source if the archive was replaced or
+    # corrupted, leaving no good copy.
+    existing = ledger.find_by_hash(sha)
+    if existing is not None and existing.current_stage == "archived":
+        if existing.archive_path and Path(existing.archive_path).exists():
+            archive_path_obj = Path(existing.archive_path)
+            sha_ok = False
+            if existing.archive_sha256:
+                try:
+                    actual_sha = dup_fingerprint.sha256_of(archive_path_obj.read_bytes())
+                    sha_ok = (actual_sha == existing.archive_sha256)
+                except Exception as exc:
+                    run.error(
+                        f"could not read archive for SHA verification at "
+                        f"{archive_path_obj}: {exc}"
+                    )
+            # sha_ok is False when archive_sha256 is unset (pre-0.12.1 ledger row)
+            # or when reading failed. In both cases treat as unverifiable.
+            if sha_ok:
+                try:
+                    pdf_path.unlink(missing_ok=True)
+                except Exception as exc:
+                    run.error(f"could not unlink leftover {pdf_path}: {exc}")
+                run.info(
+                    f"cleaned up leftover source {name} "
+                    f"(archive verified at {existing.archive_path})"
+                )
+                return
+            else:
+                out.unmatched.append({
+                    "fileName": name,
+                    "reason": (
+                        "Ledger says archived but archive SHA mismatch or unverifiable "
+                        f"(archive at {existing.archive_path}) — investigate before deleting source"
+                    ),
+                    "planKey": "",
+                    "apName": ap_name,
+                    "localPath": local_path,
+                    "mtimeIso": mtime_iso,
+                })
+                return
+        out.unmatched.append({
+            "fileName": name,
+            "reason": (
+                "Ledger says archived but archive file is missing — "
+                "investigate before re-running"
+            ),
+            "planKey": "",
+            "apName": ap_name,
+            "localPath": local_path,
+            "mtimeIso": mtime_iso,
+        })
+        return
+
+    _, plan_norm = plan_match.plan_from_filename(name)
     if not plan_norm:
         out.unmatched.append({
             "fileName": name,
@@ -157,12 +234,6 @@ def _archive_one(
             "localPath": local_path,
             "mtimeIso": mtime_iso,
         })
-        return
-
-    try:
-        pdf_bytes = pdf_path.read_bytes()
-    except Exception as exc:
-        run.error(f"read {pdf_path}: {exc}")
         return
 
     paid_values = extract_paid_stamp_values(pdf_bytes)
@@ -205,7 +276,6 @@ def _archive_one(
 
     plan_folder = paths.strata_plan_folder(plan_row.plan_raw)
     if not plan_folder.exists():
-        # Per N8n flow's behaviour: tag as unmatched if folder missing
         try:
             plan_folder.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
@@ -222,17 +292,10 @@ def _archive_one(
     archive_name = _build_archive_name(
         paid_values.check_number, month, year, plan_norm,
     )
-    archive_path = plan_folder / archive_name
 
-    # Flatten the AcroForm fields (Paid stamp and any remaining widgets) into
-    # static text on the archived copy. The AP-folder source keeps its
-    # editable form so the operator can re-open and verify in Acrobat; only
-    # the Strata_Plans archive is permanently flat.
-    #
-    # Fail closed if flatten raises: leave the AP source in place, surface
-    # the error in the morning email, and let the next run retry. Silently
-    # writing unflattened bytes would put an editable PDF into the
-    # permanent archive AND delete the source — see Codex review of 0.12.0.
+    # Flatten the AcroForm fields into static text on the archived copy.
+    # Done BEFORE the crash-gap scan so we can verify any existing archive
+    # by content hash (not just by filename). Fail closed: leave source for retry.
     try:
         archive_bytes = flatten_acroform(pdf_bytes)
     except Exception as exc:
@@ -249,53 +312,96 @@ def _archive_one(
         })
         return
 
+    archive_sha = dup_fingerprint.sha256_of(archive_bytes)
+
+    # Physical safety-net: a prior run may have written the archive but died
+    # before the ledger write (crash gap). Verify by content SHA — not just
+    # by filename — so a different invoice that happens to produce the same
+    # archive filename (same check/plan/month) does NOT trigger crash-gap and
+    # get silently discarded. Only enter recovery when the on-disk file is
+    # byte-for-byte identical to what this source would produce.
+    base_stem = Path(archive_name).stem
+    base_suffix = Path(archive_name).suffix
+    existing_archive: Path | None = None
+    try:
+        for candidate in plan_folder.iterdir():
+            if not candidate.is_file():
+                continue
+            cname = candidate.name
+            if cname == archive_name or (
+                cname.startswith(f"{base_stem} (") and cname.endswith(base_suffix)
+            ):
+                try:
+                    if dup_fingerprint.sha256_of(candidate.read_bytes()) == archive_sha:
+                        existing_archive = candidate
+                        break
+                except Exception:
+                    pass
+    except Exception as exc:
+        run.error(f"could not scan plan folder {plan_folder}: {exc}")
+
+    if existing_archive is not None:
+        try:
+            if existing is not None:
+                ledger.update_stage(
+                    sha, "archived",
+                    archive_path=str(existing_archive),
+                    archive_sha256=archive_sha,
+                )
+            else:
+                inv_num, amount = dup_fingerprint.compute_layer_b(pdf_bytes, plan_norm)
+                ledger.upsert(dup_ledger.make_row(
+                    sha256=sha,
+                    plan_norm=plan_norm,
+                    invoice_number=inv_num,
+                    amount_cents=amount,
+                    current_stage="archived",
+                    archive_path=str(existing_archive),
+                    archive_sha256=archive_sha,
+                ))
+        except Exception as exc:
+            run.error(f"crash-gap ledger update failed for {name}: {exc}")
+            out.unmatched.append({
+                "fileName": name,
+                "reason": (
+                    f"Archive exists on disk but ledger update failed — "
+                    f"investigate: {exc}"
+                ),
+                "planKey": plan_norm,
+                "apName": ap_name,
+                "localPath": local_path,
+                "mtimeIso": mtime_iso,
+            })
+            return
+        try:
+            pdf_path.unlink(missing_ok=True)
+        except Exception as exc:
+            run.error(f"could not unlink source after crash-gap recovery {pdf_path}: {exc}")
+        run.info(f"crash-gap recovery: cleaned {name} -> {existing_archive}")
+        return
+
+    # archive_bytes and archive_sha are already computed above.
+    # safe_write_unique handles both the normal case and the retry case:
+    # identical bytes at archive_path → returns it unchanged (idempotent);
+    # a different invoice with the same archive name → (N) collision copy.
+    archive_path = plan_folder / archive_name
     try:
         archive_written = safe_io.safe_write_unique(archive_path, archive_bytes)
     except Exception as exc:
         run.error(f"write {archive_path}: {exc}")
         return
 
-    # Write the Processed marker BEFORE unlinking the AP copy. If the marker
-    # write fails, the source PDF stays in place so Step 6 retries it next
-    # run — and the archive is now durably written, so retry is idempotent.
-    processed_path = pdf_path.parent / safe_io.sanitize_filename(_processed_counterpart(name))
+    # Fail-closed ledger update: source is only deleted after the ledger
+    # confirms the destination write. A log-only error here would leave the
+    # ledger out of sync while the source disappears silently.
     try:
-        safe_io.safe_write_unique(processed_path, pdf_bytes)
-    except Exception as exc:
-        run.error(
-            f"could not write processed marker for {name}: {exc} — "
-            f"leaving source in place; archive already at {archive_written}"
-        )
-        out.processed.append({
-            "fileName": name,
-            "planRaw": plan_row.plan_raw,
-            "apName": plan_row.ap_name,
-            "checkNumber": paid_values.check_number,
-            "destination": str(archive_written),
-            "status": "Archived; processed marker write failed (will retry)",
-        })
-        return
-    try:
-        pdf_path.unlink(missing_ok=True)
-    except Exception as exc:
-        run.error(f"could not unlink AP source {pdf_path}: {exc}")
-
-    # Enrich the duplicate-detection ledger with the final archive location.
-    # By Step 6 we know the archive_path that the daily duplicate summary
-    # email will reference. If the row doesn't exist yet (orphan that
-    # bypassed Steps 1/3/5), insert it now so future arrivals get caught.
-    # Orphans have no email context — sender_domain stays blank (make_row
-    # default), so the orphan row gets Layer A coverage only.
-    # `sha` is the chain SHA carried through intake -> AP -> archive
-    # (computed on the AP-folder bytes, pre-flatten). `archive_sha` is
-    # the on-disk hash of the flattened archive copy; without it,
-    # tools/dup_reconcile.py would report every archived file as an
-    # orphan because the byte content differs after flatten_acroform.
-    sha = dup_fingerprint.sha256_of(pdf_bytes)
-    archive_sha = dup_fingerprint.sha256_of(archive_bytes)
-    try:
-        existing = ledger.find_by_hash(sha)
-        if existing is None:
+        if existing is not None:
+            ledger.update_stage(
+                sha, "archived",
+                archive_path=str(archive_written),
+                archive_sha256=archive_sha,
+            )
+        else:
             inv_num, amount = dup_fingerprint.compute_layer_b(pdf_bytes, plan_norm)
             ledger.upsert(dup_ledger.make_row(
                 sha256=sha,
@@ -306,14 +412,22 @@ def _archive_one(
                 archive_path=str(archive_written),
                 archive_sha256=archive_sha,
             ))
-        else:
-            ledger.update_stage(
-                sha, "archived",
-                archive_path=str(archive_written),
-                archive_sha256=archive_sha,
-            )
     except Exception as exc:
         run.error(f"ledger archive update failed for {sha[:12]}... ({name}): {exc}")
+        out.unmatched.append({
+            "fileName": name,
+            "reason": f"Archived but ledger update failed — will retry on next run: {exc}",
+            "planKey": plan_norm,
+            "apName": ap_name,
+            "localPath": local_path,
+            "mtimeIso": mtime_iso,
+        })
+        return
+
+    try:
+        pdf_path.unlink(missing_ok=True)
+    except Exception as exc:
+        run.error(f"could not unlink AP source {pdf_path}: {exc}")
 
     out.processed.append({
         "fileName": name,
@@ -325,59 +439,6 @@ def _archive_one(
     })
     run.info(f"archived {name} -> {archive_written}")
 
-
-def _archive_exists_for(name: str, plan_row: PlanRow, pdf_path: Path) -> bool | None:
-    """Reconcile that an archive landed for this Paid_Invoices entry.
-
-    Used when the `Processed - <name>` counterpart already exists in the AP
-    folder: confirm there's a matching archive in `Strata_Plans/<plan>/`
-    before we silently skip the file. Returns:
-      * True — an archive with the expected name is present.
-      * False — counterpart exists but no archive — caller surfaces this.
-      * None — we couldn't determine an expected location (missing plan,
-        unreadable check number, unreadable date). Caller falls back to the
-        old skip-silent behaviour so we don't generate noise for genuinely
-        ambiguous state.
-    `safe_write_unique` may have added " (1)" / " (2)" on collision, so the
-    check is "any file matching the expected stem exists" rather than an
-    exact path lookup.
-
-    Re-derives the archive name through `_build_archive_name` to stay in
-    lockstep with `_archive_one` — if the two ever diverge, every previously
-    processed file would throw a false "stale processed marker" error.
-    """
-    _, plan_norm = plan_match.plan_from_filename(name)
-    if not plan_norm:
-        return None
-    try:
-        plan_folder = paths.strata_plan_folder(plan_row.plan_raw)
-    except Exception:
-        return None
-    if not plan_folder.exists():
-        return None
-    try:
-        paid_values = extract_paid_stamp_values(pdf_path.read_bytes())
-    except Exception:
-        return None
-    if not paid_values.has_check_number:
-        return None
-    parsed_date = parse_paid_date(paid_values.paid_date)
-    if parsed_date is None:
-        return None
-    month, year = parsed_date
-    base = _build_archive_name(paid_values.check_number, month, year, plan_norm)
-    stem = Path(base).stem
-    suffix = Path(base).suffix
-    # Match either the exact name or the collision-renamed variants.
-    for candidate in plan_folder.iterdir():
-        if not candidate.is_file():
-            continue
-        cname = candidate.name
-        if cname == base:
-            return True
-        if cname.startswith(f"{stem} (") and cname.endswith(suffix):
-            return True
-    return False
 
 
 def _scan_unmatched_intake() -> _ScanResult:
@@ -410,6 +471,8 @@ def _scan_unmatched_intake() -> _ScanResult:
             # Skip the entry rather than tank the whole scan.
             continue
         if _is_processed(p.name):
+            continue
+        if _is_os_junk(p.name):
             continue
         result.rows.append({
             "fileName": p.name,
@@ -678,42 +741,12 @@ def main() -> int:
             if not folder.exists():
                 continue
 
-            existing = {p.name for p in folder.glob("*.pdf")}
-
             for pdf_path in sorted(folder.glob("*.pdf")):
                 name = pdf_path.name
                 if _is_processed(name):
                     continue
-                if _processed_counterpart(name) in existing:
-                    # Processed counterpart already in the folder. Reconcile
-                    # against the archive location — if the archive is missing
-                    # we'd silently lose this invoice on retry, so surface the
-                    # inconsistency rather than skip quietly.
-                    _, plan_norm = plan_match.plan_from_filename(name)
-                    plan_row = plan_to_path.get(plan_norm) if plan_norm else None
-                    archive_state = (
-                        _archive_exists_for(name, plan_row, pdf_path)
-                        if plan_row else None
-                    )
-                    if archive_state is None or archive_state is True:
-                        continue
-                    run.error(
-                        f"stale processed marker for {name}: archive missing in "
-                        f"Strata_Plans/{plan_row.plan_raw}/ — flagged for manual review"
-                    )
-                    out.unmatched.append({
-                        "fileName": name,
-                        "reason": (
-                            "Processed marker present but archive missing — "
-                            "investigate before re-running"
-                        ),
-                        "planKey": plan_norm or "",
-                        "apName": ap.ap_name,
-                        "localPath": str(pdf_path),
-                        "mtimeIso": _format_mtime(pdf_path),
-                    })
+                if _is_os_junk(name):
                     continue
-
                 _archive_one(pdf_path, plan_to_path, out, ledger, run, ap.ap_name)
 
         run.processed = len(out.processed)

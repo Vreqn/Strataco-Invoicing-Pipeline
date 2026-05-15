@@ -212,11 +212,13 @@ def parse_archive_filename(name: str) -> dict | None:
     collision-renamed `... inv (1).pdf` variant produced by
     `safe_io.safe_write_unique`. Returns `{check, month, year, plan_norm}` or
     `None`. Rejects names whose `monthname` and numeric `month` disagree so a
-    Step-6 bug can't silently feed a misnamed Summary.
+    Step-6 bug can't silently feed a misnamed summary.
 
     Used by Step 7 to scan `Strata_Plans/<plan>/` for invoices from a target
-    month. Does NOT match the Step-7 Summary output (`Summary - ...`) — that's
-    filtered by name prefix at the call site as belt-and-suspenders.
+    month. New-format summaries (`{MM} - {plan_norm} ...`, written to
+    `Processed/{YYYY}/{MM} - {MonthName}/`) live in a subdirectory and never
+    reach this parser. The `"summary -"` prefix guard below covers pre-change
+    files that may still exist in the plan root.
     """
     import calendar
 
@@ -224,9 +226,9 @@ def parse_archive_filename(name: str) -> dict | None:
         return None
     stripped = str(name).strip()
     # Reject prefixes that aren't Step 6's archive emit. The "summary -"
-    # rejection is defensive: Step 7's own output also lives in the same
-    # folder, and a permissive parser would re-aggregate it on the next run
-    # if the call-site filter ever drifted.
+    # rejection covers old-format summary files (pre-change) that may still
+    # sit in the plan root; new summaries live in Processed/ and never reach
+    # this function.
     low = stripped.lower()
     if low.startswith((
         "processed -", "processed-",
@@ -354,6 +356,10 @@ class PdfMatchResult:
     plan_row: PlanRow | None
     note: str
     detected: list[tuple[str, int]]  # (token, count) sorted desc by count
+    # True when plan_row was resolved via the base-without-suffix fallback
+    # (e.g. PDF says "BCS 2707" but managed list only has "BCS 2707A"/"BCS 2707B").
+    # Callers use this to flag for front-desk disambiguation rather than auto-file.
+    is_base_fallback: bool = False
 
 
 def match_from_pdf_text(
@@ -408,9 +414,7 @@ def match_from_pdf_text(
     for m in plan_re.finditer(text_up):
         prefix, num, suf = m.group(1) or "", m.group(2) or "", (m.group(3) or "").strip()
         full = f"{prefix}{num}{suf}"
-        base = f"{prefix}{num}"
         detected[full] += 1
-        detected[base] += 1
         numbers_seen.add(num)
 
     # No-digit plans (e.g. GVCCA / TCLUB)
@@ -475,13 +479,15 @@ def match_from_pdf_text(
     if second is None or top[1] >= second[1] + 3:
         plan_norm = top[0]
         row = plan_to_row.get(plan_norm)
+        is_base_fallback = False
         if row is None:
             # base-without-suffix fallback: take the first variant's row,
             # but override the manager/ap to the unique one if present.
             variants = base_to_plans.get(plan_norm, [])
             if variants:
                 row = plan_to_row[variants[0]]
-        return PdfMatchResult(plan_norm, row, "", detected_sorted)
+                is_base_fallback = True
+        return PdfMatchResult(plan_norm, row, "", detected_sorted, is_base_fallback)
     return PdfMatchResult(
         "", None,
         f"Ambiguous: {top[0]} vs {second[0]}. Leaving unmatched.",

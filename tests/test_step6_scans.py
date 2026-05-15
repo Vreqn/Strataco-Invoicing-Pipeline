@@ -93,6 +93,33 @@ def test_intake_mixed_contents() -> None:
         assert all(r.get("mtimeIso") for r in result.rows), "all_have_mtime"
 
 
+def test_intake_os_junk_filtered() -> None:
+    """OS metadata files (.DS_Store, AppleDouble sidecars, Thumbs.db,
+    desktop.ini) reach shared folders via file-server browsing. They must
+    never be surfaced as stuck intake — a real stuck PDF still must.
+
+    The filter is scoped to those exact names: a genuinely stuck intake
+    file that happens to be dot-hidden must STILL surface, so it isn't
+    silently lost from the morning report."""
+    with _RootContext() as root:
+        folder = root / "_Unmatched" / "Invoices"
+        folder.mkdir(parents=True)
+        (folder / ".DS_Store").write_text("macos junk")
+        (folder / "._foo.pdf").write_text("appledouble sidecar")
+        (folder / "Thumbs.db").write_text("windows junk")
+        (folder / "desktop.ini").write_text("windows junk")
+        (folder / "LMS 123 - real invoice.pdf").write_text("real stuck pdf")
+        # Dot-hidden but NOT a known junk name and NOT an AppleDouble
+        # sidecar — must still be reported as stuck.
+        (folder / ".hidden invoice.pdf").write_text("dot-hidden real pdf")
+        result = _scan_unmatched_intake()
+        names = {r["fileName"] for r in result.rows}
+        assert names == {"LMS 123 - real invoice.pdf", ".hidden invoice.pdf"}, (
+            f"real pdfs surface, junk filtered: got {names}"
+        )
+        assert result.errors == [], "no_errors"
+
+
 def test_intake_unicode_filename() -> None:
     with _RootContext() as root:
         folder = root / "_Unmatched" / "Invoices"

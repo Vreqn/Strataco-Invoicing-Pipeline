@@ -53,6 +53,8 @@ PADDING_PT = 6
 BORDER_WIDTH_PT = 1.0
 FIELD_HEIGHT_PT = 16
 TITLE_FONT_SIZE = 22             # Paid stamp header — sized as a title
+HINT_FONT_SIZE = 7               # date-format caption in the Paid title band
+HINT_COLOR = Color(0.5, 0.5, 0.5)
 
 # Whitespace search
 RASTER_DPI = 100
@@ -418,6 +420,7 @@ class Row:
     label: str
     fixed_value: str | None  # None means render as editable field
     field_name: str | None   # None for fixed-value or pure-header rows
+    hint: str | None = None  # format hint drawn right of an editable field
 
 
 def _draw_stamp_overlay(
@@ -452,8 +455,17 @@ def _draw_stamp_overlay(
     title_block_top_y = placement.y_pt + placement.height_pt
     title_block_height = title_block_top_y - body_top_y
 
-    # Border only around the body rows.
-    if body_count > 0:
+    if title_count > 0 and body_count > 0:
+        # Outer box enclosing the entire stamp (title + body).
+        c.setStrokeColor(color)
+        c.setLineWidth(BORDER_WIDTH_PT)
+        c.rect(placement.x_pt, placement.y_pt, placement.width_pt, placement.height_pt, stroke=1, fill=0)
+        # Separator between title band and body rows.
+        c.setStrokeColor(color)
+        c.setLineWidth(BORDER_WIDTH_PT)
+        c.line(placement.x_pt, body_top_y, placement.x_pt + placement.width_pt, body_top_y)
+    elif body_count > 0:
+        # Received stamp: border only around the body rows (no title rows).
         c.setStrokeColor(color)
         c.setLineWidth(BORDER_WIDTH_PT)
         c.rect(placement.x_pt, placement.y_pt, placement.width_pt, body_height, stroke=1, fill=0)
@@ -469,6 +481,18 @@ def _draw_stamp_overlay(
             c.setFillColor(color)
             c.setFont("Helvetica-Bold", TITLE_FONT_SIZE)
             c.drawCentredString(center_x, text_y, row.label)
+
+        # Format-hint caption: drawn in the title band, just above the body
+        # box, centered. It deliberately lives OFF every field's read
+        # baseline — a hint on the "Date:" row would be swept up by the
+        # positioned-text reader and corrupt the extracted date. The text
+        # also carries no "date"/"check" tokens or digits, so no reader
+        # tier (label-match or regex) can mistake it for a value.
+        hint = next((r.hint for r in body_rows if r.hint), None)
+        if hint:
+            c.setFillColor(HINT_COLOR)
+            c.setFont("Helvetica", HINT_FONT_SIZE)
+            c.drawCentredString(center_x, body_top_y + 3, hint)
 
     # --- Body rows (inside the border) ---
     label_x = placement.x_pt + PADDING_PT
@@ -539,7 +563,7 @@ def flatten_acroform(pdf_bytes: bytes) -> bytes:
         pdf.generate_appearance_streams()
         pdf.flatten_annotations(mode="all")
         out = io.BytesIO()
-        pdf.save(out)
+        pdf.save(out, deterministic_id=True)
         return out.getvalue()
 
 
@@ -657,21 +681,43 @@ def _merge_overlay_onto_page_one(pdf_bytes: bytes, overlay_bytes: bytes) -> byte
 # ---------------------------------------------------------------- public API
 
 
-def _stamp_id() -> str:
-    return str(int(time.time() * 1000))
+def _stamp_id(seed: str = "") -> str:
+    return seed[:16] if seed else str(int(time.time() * 1000))
+
+
+def received_stamp_sha_matches(pdf_bytes: bytes, sha: str) -> bool:
+    """Return True if pdf_bytes contains a Received stamp created from source PDF with `sha`.
+
+    Checks for the deterministic AcroForm field name that render_received_stamp
+    writes when sha is provided. Used by step_3 to detect cross-day retries so
+    it can reuse the already-written dest bytes instead of re-stamping with a new date.
+    """
+    if not sha:
+        return False
+    expected_field = f"gl_code_{sha[:16]}"
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        fields = reader.get_fields()
+        return fields is not None and expected_field in fields
+    except Exception:
+        return False
 
 
 def render_received_stamp(
     pdf_bytes: bytes,
     received_date: str,
     plan_pretty: str,
+    sha: str = "",
 ) -> bytes:
     """Add the red Received stamp to page 1.
 
     Rows 1-2 are hardcoded (received_date, plan_pretty). Rows 3-7 are
     editable AcroForm text fields the manager fills in.
+
+    Pass `sha` (the source PDF's SHA-256 hex string) to generate deterministic
+    AcroForm field names, enabling content-idempotency on retry.
     """
-    sid = _stamp_id()
+    sid = _stamp_id(sha)
     rows = [
         Row("Received:", received_date, None),
         Row("Strata Plan #:", plan_pretty, None),
@@ -684,16 +730,19 @@ def render_received_stamp(
     return _render_stamp(pdf_bytes, rows, color=RED, height_pt=STAMP_HEIGHT_RECEIVED_PT)
 
 
-def render_paid_stamp(pdf_bytes: bytes) -> bytes:
+def render_paid_stamp(pdf_bytes: bytes, sha: str = "") -> bytes:
     """Add the blue Paid stamp to page 1.
 
     Header row says 'Paid' (no value field). Date and Check Number rows are
     blank editable AcroForm text fields the accountant fills in before saving.
+
+    Pass `sha` (the source PDF's SHA-256 hex string) for deterministic field
+    names, enabling content-idempotency on retry.
     """
-    sid = _stamp_id()
+    sid = _stamp_id(sha)
     rows = [
         Row("PAID", None, None),  # header-only row
-        Row("Date:", None, f"paid_date_{sid}"),
+        Row("Date:", None, f"paid_date_{sid}", hint="format:  MMM DD YYYY"),
         Row("Check Number:", None, f"paid_check_number_{sid}"),
     ]
     return _render_stamp(pdf_bytes, rows, color=BLUE, height_pt=STAMP_HEIGHT_PAID_PT)

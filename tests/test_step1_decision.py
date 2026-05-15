@@ -114,15 +114,15 @@ def test_lone_no_plan_routes_as_subject() -> None:
     )
 
 
-def test_multi_pdf_no_plan_flags() -> None:
-    """In a multi-PDF email, a PDF carrying no plan number of its own hasn't
-    cleared the dual-factor bar — we can't tell a plan-less real invoice from a
-    plan-less boilerplate notice the vendor stapled on. Hold the whole email
-    for the front desk rather than stamping and filing a guess.
+def test_multi_pdf_no_plan_routes_as_subject() -> None:
+    """Policy change 0.18.0 (ops team review): multi-PDF emails with NO_PLAN
+    siblings now return ROUTE_AS_SUBJECT instead of FLAG_AND_HOLD. The AGREE/EMPTY
+    PDFs are stamped and filed; NO_PLAN PDFs are skipped in the routing loop, and
+    _process_self_attachments forwards the full original email to the plan manager.
 
-    Regression: 0.15.0's NO_PLAN routed these on the subject, which silently
-    stamped and filed FSC_Fuel_Surcharge_.pdf as a BCS 3396 invoice
-    (2026-05-14 diagnostic-run incident).
+    Previous behaviour (0.15.2–0.17.x): multi-PDF + any NO_PLAN → FLAG (held for
+    front-desk review). Changed because the manager should decide what to do with
+    plan-less extras; the front desk doesn't need to see these emails any more.
     """
     a = _decide_email_action(
         "BCS2707",
@@ -131,11 +131,8 @@ def test_multi_pdf_no_plan_flags() -> None:
             _cls(PdfOutcome.NO_PLAN, base_name="FSC_Fuel_Surcharge_.pdf"),
         ],
     )
-    assert a.kind == EmailActionKind.FLAG_AND_HOLD, (
-        f"[AGREE + NO_PLAN] expected FLAG_AND_HOLD, got {a.kind}"
-    )
-    assert "FSC_Fuel_Surcharge_.pdf" in a.reason, (
-        f"[AGREE + NO_PLAN] reason should name the plan-less PDF, got {a.reason!r}"
+    assert a.kind == EmailActionKind.ROUTE_AS_SUBJECT, (
+        f"[AGREE + NO_PLAN] expected ROUTE_AS_SUBJECT (0.18.0 policy), got {a.kind}"
     )
 
     a = _decide_email_action(
@@ -145,8 +142,8 @@ def test_multi_pdf_no_plan_flags() -> None:
             _cls(PdfOutcome.NO_PLAN, base_name="plainvoice.pdf"),
         ],
     )
-    assert a.kind == EmailActionKind.FLAG_AND_HOLD, (
-        f"[EMPTY + NO_PLAN] expected FLAG_AND_HOLD, got {a.kind}"
+    assert a.kind == EmailActionKind.ROUTE_AS_SUBJECT, (
+        f"[EMPTY + NO_PLAN] expected ROUTE_AS_SUBJECT (0.18.0 policy), got {a.kind}"
     )
 
     a = _decide_email_action(
@@ -156,8 +153,8 @@ def test_multi_pdf_no_plan_flags() -> None:
             _cls(PdfOutcome.NO_PLAN, base_name="b.pdf"),
         ],
     )
-    assert a.kind == EmailActionKind.FLAG_AND_HOLD, (
-        f"[NO_PLAN + NO_PLAN] expected FLAG_AND_HOLD, got {a.kind}"
+    assert a.kind == EmailActionKind.ROUTE_AS_SUBJECT, (
+        f"[NO_PLAN + NO_PLAN] expected ROUTE_AS_SUBJECT (0.18.0 policy), got {a.kind}"
     )
 
 
@@ -331,6 +328,101 @@ def test_distinct_bases_auto_split() -> None:
     plans_routed = {a.per_pdf_plan[i].plan_norm for i in range(3)}
     assert plans_routed == {"BCS2800", "EPS4280", "LMS222"}, (
         f"[3 distinct bases] expected all three plans routed, got {plans_routed}"
+    )
+
+
+def test_pdf_override_routes_to_pdf_plan() -> None:
+    """Decision 01: when the PDF text confidently identifies a managed plan that
+    differs from the subject, trust the PDF. Route to the PDF's plan, not the
+    subject's — but keep the email-level action as ROUTE_AS_SUBJECT (no flag).
+    """
+    a = _decide_email_action(
+        "BCS2707",
+        [_cls(PdfOutcome.PDF_OVERRIDE, plan="BCS2800", base_name="invoice.pdf")],
+    )
+    assert a.kind == EmailActionKind.ROUTE_AS_SUBJECT, (
+        f"[single PDF_OVERRIDE] expected ROUTE_AS_SUBJECT, got {a.kind}"
+    )
+    assert 0 in a.per_pdf_plan, (
+        f"[single PDF_OVERRIDE] expected per_pdf_plan[0] to be populated"
+    )
+    assert a.per_pdf_plan[0].plan_norm == "BCS2800", (
+        f"[single PDF_OVERRIDE] expected routing to BCS2800, got {a.per_pdf_plan[0].plan_norm!r}"
+    )
+
+
+def test_pdf_override_consensus_routes_to_pdf_plan() -> None:
+    """Multiple PDFs all PDF_OVERRIDE to the same plan → route to that plan."""
+    a = _decide_email_action(
+        "BCS2707",
+        [
+            _cls(PdfOutcome.PDF_OVERRIDE, plan="BCS2800", base_name="a.pdf"),
+            _cls(PdfOutcome.PDF_OVERRIDE, plan="BCS2800", base_name="b.pdf"),
+        ],
+    )
+    assert a.kind == EmailActionKind.ROUTE_AS_SUBJECT, (
+        f"[consensus PDF_OVERRIDE] expected ROUTE_AS_SUBJECT, got {a.kind}"
+    )
+    for idx in (0, 1):
+        assert a.per_pdf_plan.get(idx, None) is not None and a.per_pdf_plan[idx].plan_norm == "BCS2800", (
+            f"[consensus PDF_OVERRIDE] per_pdf_plan[{idx}] should route to BCS2800"
+        )
+
+
+def test_pdf_override_plus_empty_routes() -> None:
+    """PDF_OVERRIDE alongside EMPTY: EMPTY routes on subject, override routes to PDF's plan."""
+    a = _decide_email_action(
+        "BCS2707",
+        [
+            _cls(PdfOutcome.EMPTY, base_name="scanned.pdf"),
+            _cls(PdfOutcome.PDF_OVERRIDE, plan="BCS2800", base_name="invoice.pdf"),
+        ],
+    )
+    assert a.kind == EmailActionKind.ROUTE_AS_SUBJECT, (
+        f"[EMPTY + PDF_OVERRIDE] expected ROUTE_AS_SUBJECT, got {a.kind}"
+    )
+    assert 1 in a.per_pdf_plan and a.per_pdf_plan[1].plan_norm == "BCS2800", (
+        f"[EMPTY + PDF_OVERRIDE] per_pdf_plan[1] should route to BCS2800"
+    )
+    assert 0 not in a.per_pdf_plan, (
+        f"[EMPTY + PDF_OVERRIDE] per_pdf_plan[0] (EMPTY) should not be overridden"
+    )
+
+
+def test_pdf_override_suffix_variant_flags() -> None:
+    """PDF_OVERRIDE to suffix-variant plans still flags — same guard as CLASH."""
+    a = _decide_email_action(
+        "BCS2707",
+        [
+            _cls(PdfOutcome.PDF_OVERRIDE, plan="BCS2707A", base_name="a.pdf"),
+            _cls(PdfOutcome.PDF_OVERRIDE, plan="BCS2707B", base_name="b.pdf"),
+        ],
+    )
+    assert a.kind == EmailActionKind.FLAG_AND_HOLD, (
+        f"[PDF_OVERRIDE suffix variants] expected FLAG_AND_HOLD, got {a.kind}"
+    )
+    assert "suffix-variant" in a.reason.lower(), (
+        f"[PDF_OVERRIDE suffix variants] reason should mention suffix-variant, got {a.reason!r}"
+    )
+
+
+def test_pdf_override_distinct_bases_auto_split() -> None:
+    """PDF_OVERRIDE to two different plans (distinct bases) → AUTO_SPLIT."""
+    a = _decide_email_action(
+        "BCS2707",
+        [
+            _cls(PdfOutcome.PDF_OVERRIDE, plan="BCS2800", base_name="a.pdf"),
+            _cls(PdfOutcome.PDF_OVERRIDE, plan="EPS4280", base_name="b.pdf"),
+        ],
+    )
+    assert a.kind == EmailActionKind.AUTO_SPLIT, (
+        f"[PDF_OVERRIDE distinct bases] expected AUTO_SPLIT, got {a.kind}"
+    )
+    assert a.per_pdf_plan.get(0) is not None and a.per_pdf_plan[0].plan_norm == "BCS2800", (
+        f"[PDF_OVERRIDE distinct bases] per_pdf_plan[0] should be BCS2800"
+    )
+    assert a.per_pdf_plan.get(1) is not None and a.per_pdf_plan[1].plan_norm == "EPS4280", (
+        f"[PDF_OVERRIDE distinct bases] per_pdf_plan[1] should be EPS4280"
     )
 
 

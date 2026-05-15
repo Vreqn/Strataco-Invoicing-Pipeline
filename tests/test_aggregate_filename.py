@@ -7,8 +7,8 @@ wrong ones. The cases here pin down:
   - The exact Step 6 emit format
   - safe_write_unique's collision suffix `... (1).pdf`
   - The MonthName-vs-MM consistency check
-  - Rejection of the Step 7 Summary output (so Step 7 never re-aggregates
-    its own Summaries)
+  - Rejection of the Step 7 summary output (so Step 7 never re-aggregates
+    its own summaries)
 """
 
 from __future__ import annotations
@@ -62,14 +62,22 @@ def test_tolerates_collision_suffix() -> None:
 
 
 def test_rejects_step7_summary() -> None:
-    cases = [
+    # Old-format summaries (pre-change) — rejected by the "summary -" prefix guard.
+    old_format = [
         "Summary - 05 - BCS1234 May 2026 inv.pdf",
         "Summary - 05 - BCS1234 May 2026 inv (1).pdf",
         "summary - 05 - BCS1234 May 2026 inv.pdf",
         "SUMMARY - 05 - BCS1234 May 2026 inv.pdf",
         "Summary-05 - BCS1234 May 2026 inv.pdf",
     ]
-    for name in cases:
+    # New-format summaries (`{MM} - {plan} ...`) — rejected by the regex because
+    # Step 6 archives always have a check-number prefix before the month
+    # (`check - MM - plan`); a bare `MM - plan` has no check prefix and won't match.
+    new_format = [
+        "05 - BCS1234 May 2026 inv.pdf",
+        "05 - BCS1234 May 2026 inv (1).pdf",
+    ]
+    for name in old_format + new_format:
         got = parse_archive_filename(name)
         assert got is None, f"[reject summary {name!r}] expected None, got {got}"
 

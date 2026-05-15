@@ -6,6 +6,10 @@
 > **owner decision worksheet**, not staff training. It is developer-adjacent in that
 > every decision here maps to an open entry in `To-Speak-About.txt`.
 
+> **Status (2026-05-14): meeting complete.** All decisions have been recorded below
+> and transferred to `To-Speak-About.txt`. Code changes implementing Decisions 1, 4,
+> and 5 are live in v0.16.0 (all 269 tests passing).
+
 ---
 
 ## Context — why this document exists
@@ -21,6 +25,12 @@ desk, and some flags can't actually be cleared by the normal recovery step, whic
 creates loops. The owners need to decide, scenario by scenario, **how strict each
 policy should be** — where to trust the system more, and where to keep the safety net
 tight.
+
+**Scale so far:** this isn't theoretical. Across its first six live runs
+(2026-05-12 through 2026-05-14, the latest on v0.15.0), the system has handled roughly
+**359 invoice files** end-to-end — the very first run alone cleared a 224-item inbox
+backlog, and the runs since have added the rest. Every scenario below is drawn from
+that real traffic, not invented.
 
 This worksheet lays out every place the system trusts, every place it flags, and every
 place a too-strict rule can trap an email in a loop. Each item ends with a blank
@@ -116,12 +126,12 @@ Many invoices are scanned images with no machine-readable text. The system can't
 cross-check those, so it **trusts whatever the subject said** and files it.
 - **Comfortable with this?** It means: if a vendor scans an invoice *and* the front
   desk (or vendor) typed the wrong plan in the subject, it files wrong silently.
-- **Decision:** ______________________
+- **Decision (2026-05-14):** Comfortable as-is — current behaviour is correct.
 
 ### 1.3 — Subject matches, PDF has text but never prints a plan number → trusts the subject *(trust-loose point)*
 Some invoices simply don't print the strata plan number anywhere. Same as above — the
 system trusts the subject because the PDF gave it nothing to contradict.
-- **Decision:** ______________________
+- **Decision (2026-05-14):** Comfortable as-is — current behaviour is correct.
 
 ### 1.4 — One email, multiple invoices for clearly different buildings → auto-split silently
 If an email has two invoices and they point at plainly different plans (e.g. BCS 2707
@@ -129,13 +139,15 @@ and BCS 2800 — different buildings, no chance of confusion), the system files 
 to its own plan automatically.
 - **Mostly fine** — the risk only appears when the two plans are *related* (see
   Decision 3). Worth knowing it happens silently.
-- **Decision (note any concern):** ______________________
+- **Decision (2026-05-14):** No concern. When non-invoice extras appear alongside
+  invoices in the same email, the system forwards the full email to ALL involved
+  managers (v0.16.0). Each invoice routes to its own plan's manager.
 
 ### 1.5 — Plan number found only in the PDF's filename → trusted as a fallback *(trust-loose point)*
 If nothing else gives a plan number, the system will trust the plan number in the
 *filename* the vendor used.
 - **Comfortable with this?** Filenames are vendor-controlled and can be sloppy.
-- **Decision:** ______________________
+- **Decision (2026-05-14):** Comfortable as-is — current behaviour is correct.
 
 ### 1.6 — A duplicate invoice → silently skipped, email still cleared from the inbox
 If the same invoice has already been processed, the system doesn't file it again. It
@@ -148,8 +160,8 @@ When the front desk replies-to-self to rescue an email, the system files **every
 in it** — including cover letters, account statements, and other non-invoices. The
 manager then has to spot and delete those during their review.
 - This is the *opposite* problem from strictness — here the system is too trusting.
-- **Decision:** is this frequent enough to be worth filtering automatically, or is
-  manager cleanup acceptable? ______________________
+- **Decision (2026-05-14):** Manager cleanup is acceptable — not frequent enough to
+  warrant automatic filtering.
 
 ---
 
@@ -168,7 +180,10 @@ to keep it strict, ease it off, or change how it behaves.
   trust the PDF over the subject and file without flagging.
 - **The question for you:** Keep flagging every clash? Or build a "trusted vendor"
   list over time, once we have months of data showing which vendors are reliable?
-- **Decision:** ______________________
+- **Decision (2026-05-14):** Trust the PDF. When the PDF text unambiguously identifies
+  a directly-managed plan, route to that plan without flagging. Implemented as
+  `PDF_OVERRIDE` in v0.16.0. Per-vendor trusted-sender list deferred — revisit after
+  several months of operational data.
 
 ### Decision 2 — The PDF mentions a plan number that isn't on our managed list ⚠️ *loop trap*
 - **What happens now:** Flagged and held — **and there is no recovery step.** Replying
@@ -183,7 +198,9 @@ to keep it strict, ease it off, or change how it behaves.
     master list (assumes vendors are rarely wrong).
   - **(c)** Define a written manual-handling path for "real invoice, plan not on our
     list" — including moving the email to Handled to break the loop.
-- **Decision:** ______________________
+- **Decision (2026-05-14):** Front desk discretion. Contact the vendor to clarify, or
+  if the invoice isn't ours, delete the email and move it to the Handled folder to
+  break the loop. No code change needed.
 
 ### Decision 3 — One email, two invoices for closely-*related* plans (e.g. BCS 2707A and BCS 2707B)
 - **What happens now:** Flagged. Related plans that share a base number are easy to mix
@@ -195,7 +212,10 @@ to keep it strict, ease it off, or change how it behaves.
   auto-file each one — trust the vendor's per-invoice labelling.
 - **The question for you:** Keep flagging? Auto-file when each PDF is self-clear? Or a
   middle ground (auto-file only when the PDF's text *and* filename agree per invoice)?
-- **Decision:** ______________________
+- **Decision (2026-05-14):** Route each PDF to its own plan's manager. Distinct-plan
+  AUTO_SPLIT already handles this with forwarding to all involved managers (v0.16.0).
+  Suffix-variant cases with different managers (e.g. 2707A and 2707B) still flag for
+  now — to be addressed as a future enhancement once the pipeline is stable.
 
 ### Decision 4 — The PDF says "BCS 2707" but our list only has "BCS 2707A" and "BCS 2707B"
 - **What happens now:** The system files it to the right *manager* (both variants
@@ -207,7 +227,10 @@ to keep it strict, ease it off, or change how it behaves.
   - **(b)** Keep current behaviour — label with the first variant ("BCS 2707A") —
     convenient but technically misrepresents the invoice.
   - **(c)** Refuse to guess — flag it for the front desk to resolve.
-- **Decision:** ______________________
+- **Decision (2026-05-14):** Flag for front-desk correction (option c). When the PDF
+  names only a base plan and the list has only variants, the system flags and holds so
+  the front desk can confirm the correct variant. Implemented as `AMBIGUOUS` via
+  `is_base_fallback` in v0.16.0.
 
 ### Decision 5 — Does "BCS 2707A" also count as a mention of plain "BCS 2707"?
 - **What happens now:** Yes — a PDF saying "2707A" is counted as a mention of *both*
@@ -216,12 +239,16 @@ to keep it strict, ease it off, or change how it behaves.
 - **Stricter/cleaner pole:** "2707A" counts only for "2707A." Removes a class of false
   flags; small risk if a vendor *meant* the base plan but typed a suffix.
 - **Looser pole:** Leave it as-is and just document the trap.
-- **Decision:** ______________________
+- **Decision (2026-05-14):** Strict — "2707A" only counts for "2707A." Implemented in
+  v0.16.0, removing a class of avoidable flags.
 
 ### Decision 6 — A real invoice arrives with vendor boilerplate attached (cover letter, fuel-surcharge sheet) ⚠️ *loop trap — your example*
 - **What happens now:** The boilerplate PDF has no clear plan number, so **the whole
   email is flagged** — even though the real invoice in the same email is perfectly
-  clear. In one real batch this was about **8 flagged emails out of ~224.**
+  clear. How often this bites varies by batch: the first full live run (2026-05-12)
+  flagged roughly **8 emails** this way out of a large backlog; the most recent run
+  (2026-05-14) pulled **69 emails** from the inbox and only **about 2** hit this exact
+  shape.
 - **Why it loops:** Replying-to-self doesn't help — the boilerplate still has no plan,
   so it flags again. This is the exact case where you and your dad decided the front
   desk should move the email out of the inbox manually.
@@ -232,7 +259,9 @@ to keep it strict, ease it off, or change how it behaves.
     the whole email.
   - **(c)** Maintain a list of known boilerplate filenames the system learns to ignore.
   - **(d)** Combination of (b) and (c).
-- **Decision:** ______________________
+- **Decision (2026-05-14):** Already resolved by v0.18.0. The real invoice is filed;
+  the boilerplate (NO_PLAN sibling) is forwarded to the plan manager. Front desk inbox
+  stays clean.
 
 ### Decision 7 — A vendor legitimately re-bills (credit + corrected invoice) ⚠️ *loop trap*
 - **What happens now:** The system sees the same invoice number / amount / vendor and
@@ -248,7 +277,11 @@ to keep it strict, ease it off, or change how it behaves.
   - **(d)** Tiered — simple gesture for routine cases, written reason required for
     high-value ones.
   - Plus: should a reason always be recorded, optionally, or not at all?
-- **Decision:** ______________________
+- **Decision (2026-05-14):** Already resolved by the 4-field fingerprint (plan +
+  invoice # + amount + sender domain, v0.9.2). A re-bill with a corrected amount
+  differs on the amount field and is not flagged as a duplicate. A front-desk override
+  gesture for the rare edge case where all four fields match remains open for a future
+  sprint.
 
 ### Decision 8 — An invoice arrives *after* the monthly summary was already sent
 - **What happens now:** The system writes a second summary file marked "(1)" rather
@@ -258,7 +291,8 @@ to keep it strict, ease it off, or change how it behaves.
 - **Looser/cleaner pole:** Re-merge into a single updated summary — cleanest result,
   but risky if the original was already sent to someone outside the office.
 - **Middle:** Refuse to re-merge automatically; require a deliberate action.
-- **Decision:** ______________________
+- **Decision (2026-05-14):** Keep the additive "(1)" file. Nothing is overwritten;
+  front desk decides whether to send both summaries to the board or discard one.
 
 ### Decision 9 *(maintenance — lower priority for owners)* — Retire the unused safety-net steps?
 - **What happens now:** Two early "safety-net" stages of the pipeline now do nothing in
@@ -267,7 +301,8 @@ to keep it strict, ease it off, or change how it behaves.
 - **The question:** Keep them indefinitely as belt-and-braces, or retire them after a
   couple of months of confirmed no-op logs? This is really a developer call —
   included only for visibility.
-- **Decision:** ______________________
+- **Decision (2026-05-14):** Keep them running for now. Revisit after the full
+  pipeline is stable and we have several months of all-zero logs.
 
 ---
 
@@ -323,22 +358,22 @@ recognise as a trap and manually move.
 
 ## PART 4 — Summary of decisions to make
 
-| # | Decision | Strict (current) | Looser option | Decision |
+| # | Decision | Strict (current) | Looser option | Decision (2026-05-14) |
 |---|---|---|---|---|
-| 1.2 | Trust subject when PDF is an unreadable scan | — | (it already trusts) | |
-| 1.3 | Trust subject when PDF prints no plan number | — | (it already trusts) | |
-| 1.5 | Trust plan number from the filename | — | (it already trusts) | |
-| 1.7 | Rescue stamps every PDF incl. cover letters | manager cleans up | auto-filter non-invoices | |
-| 1 | Subject vs. PDF disagree | always flag | trusted-vendor list | |
-| 2 | Plan not on our managed list ⚠️ | flag, no recovery | define a clear path | |
-| 3 | Two related plans in one email | always flag | auto-split when clear | |
-| 4 | PDF says base plan, list has only variants | label by guess | label honestly / flag | |
-| 5 | "2707A" also counts as "2707" | yes (causes flags) | strict: 2707A only | |
-| 6 | Real invoice + boilerplate ⚠️ | flag whole email | auto-rescue / ignore-list | |
-| 7 | Legitimate re-bill seen as duplicate ⚠️ | developer-only override | front-desk gesture | |
-| 8 | Late invoice after monthly summary | additive "(1)" file | re-merge | |
-| 9 | Retire unused safety-net steps | keep | retire after proving idle | |
-| — | Make "move email to Handled" an official step | verbal only | written front-desk rule | |
+| 1.2 | Trust subject when PDF is an unreadable scan | — | (it already trusts) | Current behaviour correct |
+| 1.3 | Trust subject when PDF prints no plan number | — | (it already trusts) | Current behaviour correct |
+| 1.5 | Trust plan number from the filename | — | (it already trusts) | Current behaviour correct |
+| 1.7 | Rescue stamps every PDF incl. cover letters | manager cleans up | auto-filter non-invoices | Manager cleanup acceptable |
+| 1 | Subject vs. PDF disagree | always flag | trusted-vendor list | Trust PDF: `PDF_OVERRIDE` (v0.16.0) |
+| 2 | Plan not on our managed list ⚠️ | flag, no recovery | define a clear path | Front desk discretion; move to Handled |
+| 3 | Two related plans in one email | always flag | auto-split when clear | AUTO_SPLIT + all managers (v0.16.0); suffix variants still flag (future) |
+| 4 | PDF says base plan, list has only variants | label by guess | label honestly / flag | Flag: `AMBIGUOUS` via `is_base_fallback` (v0.16.0) |
+| 5 | "2707A" also counts as "2707" | yes (causes flags) | strict: 2707A only | Strict: 2707A only (v0.16.0) |
+| 6 | Real invoice + boilerplate ⚠️ | flag whole email | auto-rescue / ignore-list | v0.18.0 forward protocol resolves this |
+| 7 | Legitimate re-bill seen as duplicate ⚠️ | developer-only override | front-desk gesture | 4-field fingerprint handles re-bills (v0.9.2); edge-case gesture open |
+| 8 | Late invoice after monthly summary | additive "(1)" file | re-merge | Additive "(1)" file — keep as-is |
+| 9 | Retire unused safety-net steps | keep | retire after proving idle | Keep; revisit after pipeline stable |
+| — | Make "move email to Handled" an official step | verbal only | written front-desk rule | Official front-desk step — to be added to client training |
 
 ⚠️ = also a feedback-loop trap (Part 3)
 
@@ -346,16 +381,19 @@ recognise as a trap and manually move.
 
 ## How to use this after the meeting
 
+> **Status (2026-05-14): steps 2 and 3 below are complete.** Decisions are recorded
+> above and in `To-Speak-About.txt`. Code changes (v0.16.0) are live.
+
 1. **Take this file into Claude** and ask it to turn it into the visual one-page
    sheet for the owners — a clean grid of "what flags / what doesn't / the dial" with
    the loop-trap items marked. The structure here (Parts 1–4, the summary table) is
    already laid out to drop straight into a visual.
 2. **In the meeting,** fill in every `Decision:` line and the last column of the
-   Part 4 table.
+   Part 4 table. *(Done 2026-05-14.)*
 3. **After the meeting,** the filled-in decisions get transferred into the project's
    `To-Speak-About.txt` file — each decision below maps to an open entry there, and
    filling those `Decision:` fields is what unblocks the developer to actually make
-   the changes.
+   the changes. *(Done 2026-05-14.)*
 
 ### Accuracy check on the existing policy file
 All nine open questions in this worksheet are already correctly logged in

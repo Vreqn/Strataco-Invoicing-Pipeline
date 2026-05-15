@@ -293,6 +293,21 @@ def flag_message(message_id: str) -> None:
     _patch_json(url, {"flag": {"flagStatus": "flagged"}})
 
 
+def forward_message(message_id: str, to: str, comment: str = "") -> None:
+    """Forward a message (with all original attachments) to the given recipients."""
+    upn = _q(config.mailbox_upn())
+    msg_id = _q(message_id)
+    url = f"{GRAPH_BASE_URL}/users/{upn}/messages/{msg_id}/forward"
+    recipients = [
+        {"emailAddress": {"address": addr.strip()}}
+        for addr in (to or "").replace(",", ";").split(";")
+        if addr.strip()
+    ]
+    if not recipients:
+        raise ValueError("forward_message: no recipients")
+    _post_json(url, {"comment": comment, "toRecipients": recipients})
+
+
 def send_mail(to: str, subject: str, body: str) -> None:
     """Send a plain-text email from the configured mailbox."""
     upn = _q(config.mailbox_upn())

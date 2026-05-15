@@ -44,7 +44,7 @@ def test_append_writes_header_and_row() -> None:
         path = Path(td) / "ledger.csv"
         ledger = load(path)
         row = make_row("BCS1234", 2026, 4, "aggregated",
-                       summary_filename="Summary - 04 - BCS1234 April 2026 inv.pdf",
+                       summary_filename="04 - BCS1234 April 2026 inv.pdf",
                        sources_merged=17, now=_fixed_dt())
         ledger.append(row)
         assert path.exists(), "[append] file should exist after append"

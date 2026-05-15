@@ -143,23 +143,24 @@ def _check_sort_key(check: str) -> tuple:
 
 
 def _build_summary_name(month: int, year: int, plan_norm: str) -> str:
-    """`Summary - {MM} - {plan_norm} {MonthName} {YYYY} inv.pdf` — mirrors Step 6."""
+    """`{MM} - {plan_norm} {MonthName} {YYYY} inv.pdf`"""
     month_name = calendar.month_name[month]
     return safe_io.sanitize_filename(
-        f"Summary - {month:02d} - {plan_norm} {month_name} {year} inv.pdf"
+        f"{month:02d} - {plan_norm} {month_name} {year} inv.pdf"
     )
 
 
-def _summary_present(folder: Path, summary_path: Path) -> bool:
-    """True if the expected Summary file (or any safe_write_unique variant) exists."""
+def _summary_present(summary_path: Path) -> bool:
+    """True if the expected summary file (or any safe_write_unique variant) exists."""
     if summary_path.exists():
         return True
+    parent = summary_path.parent
+    if not parent.exists():
+        return False
     stem = summary_path.stem
     suffix = summary_path.suffix
-    for p in folder.iterdir():
-        if not p.is_file():
-            continue
-        if p.name.startswith(f"{stem} (") and p.suffix == suffix:
+    for p in parent.iterdir():
+        if p.is_file() and p.name.startswith(f"{stem} (") and p.suffix == suffix:
             return True
     return False
 
@@ -253,6 +254,23 @@ def _scan_processed_candidates(processed_dir: Path, year: int, month: int, plan_
     return candidates
 
 
+def _has_source_invoices(processed_dir: Path, summary_path: Path) -> bool:
+    """True if processed_dir contains at least one source invoice (not the summary)."""
+    if not processed_dir.exists():
+        return False
+    stem = summary_path.stem
+    suffix = summary_path.suffix
+    for p in processed_dir.iterdir():
+        if not p.is_file():
+            continue
+        if p == summary_path:
+            continue
+        if p.name.startswith(f"{stem} (") and p.suffix == suffix:
+            continue
+        return True
+    return False
+
+
 # ---------------------------------------------------------------- per-plan flow
 
 def _aggregate_one_plan(
@@ -279,8 +297,8 @@ def _aggregate_one_plan(
         _record("skipped_no_folder")
         return
 
-    summary_path = folder / _build_summary_name(month, year, plan)
     processed_dir = paths.strata_plan_processed_month(plan_row.plan_raw, year, month)
+    summary_path = processed_dir / _build_summary_name(month, year, plan)
 
     candidates, unmatched_local = _scan_candidates(folder, year, month, plan_row)
     out.unmatched.extend(unmatched_local)
@@ -299,8 +317,8 @@ def _aggregate_one_plan(
     if ledger_done and not candidates and not args.force:
         # Verify BOTH the Summary file AND Processed/ are intact. A
         # deleted/corrupt Summary shouldn't be silently treated as "done."
-        summary_ok = _summary_present(folder, summary_path)
-        processed_ok = processed_dir.exists() and any(p.is_file() for p in processed_dir.iterdir())
+        summary_ok = _summary_present(summary_path)
+        processed_ok = _has_source_invoices(processed_dir, summary_path)
         if summary_ok and processed_ok:
             _record("skipped_already_done")
         else:

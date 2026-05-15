@@ -138,13 +138,16 @@ def test_filename_uninformative_falls_through_to_pdf_text() -> None:
 
 
 def test_pdf_text_wins_over_conflicting_filename() -> None:
-    """[0.11.3 / Codex finding 3] Direct repro of the safety concern.
+    """[0.11.3 / Codex finding 3 / Decision 01] PDF text always wins over the filename.
 
     Subject says EPS6008. Filename also says EPS6008. But the PDF body actually
     contains BCS 3396. Pre-0.11.3 (filename-first) would have returned AGREE
-    against the subject and routed to EPS 6008 manager — wrong. Post-0.11.3
-    (PDF-text-first) extracts the body, finds a confident BCS3396 match, and
-    returns CLASH so the strict-first decision matrix flags the email.
+    against the subject and routed to EPS 6008 manager — wrong.
+
+    Post-0.11.3: PDF-text-first; the body's confident BCS3396 match is used.
+    Post-Decision-01 (v0.16.0): when the PDF text confidently identifies a managed
+    plan that differs from the subject, return PDF_OVERRIDE (not CLASH) so the
+    email routes to BCS3396's manager rather than being flagged.
     """
     rows = [_row("EPS6008", manager="Alice"), _row("BCS3396", manager="Bob")]
 
@@ -156,8 +159,8 @@ def test_pdf_text_wins_over_conflicting_filename() -> None:
             rows=rows,
         )
 
-    assert cls.outcome == PdfOutcome.CLASH, (
-        f"[PDF text vs filename conflict] expected CLASH (PDF text wins), "
+    assert cls.outcome == PdfOutcome.PDF_OVERRIDE, (
+        f"[PDF text vs filename conflict] expected PDF_OVERRIDE (Decision 01: trust PDF), "
         f"got {cls.outcome.value} (pdf_plan_norm={cls.pdf_plan_norm!r}, "
         f"note={cls.note!r})"
     )

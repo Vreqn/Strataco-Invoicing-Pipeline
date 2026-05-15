@@ -260,9 +260,14 @@ def test_subject_matched_zip_contents_silent_routes_via_strict_first(monkeypatch
     )
 
 
-def test_subject_matched_zip_contents_clash_flags_email(monkeypatch, tmp_path: Path) -> None:
-    """Scenario 3: subject says BCS 2707, contained PDF says BCS 2800 in its
-    text. Strict-first → flag the email, write nothing."""
+def test_subject_matched_zip_contents_pdf_override_routes(monkeypatch, tmp_path: Path) -> None:
+    """Scenario 3 (Decision 01 / v0.16.0): subject says BCS 2707, but the
+    contained PDF's text confidently identifies BCS 2800. Trust the PDF —
+    route to Bob Jones (BCS 2800 manager) without flagging.
+
+    Pre-Decision-01: this scenario returned CLASH → FLAG (strict-first).
+    Post-Decision-01: PDF text wins → PDF_OVERRIDE → route to PDF's plan.
+    """
     pdf_clash = _pdf_with_marker("clash-2800")
     zip_bytes = _build_zip([("inv_001.pdf", pdf_clash)])
     attachments = [_zip_att("April invoices.zip", att_id="zip-1")]
@@ -275,19 +280,24 @@ def test_subject_matched_zip_contents_clash_flags_email(monkeypatch, tmp_path: P
         text_by_blob=text_by_blob, plan_norm="BCS2707",
     )
 
-    m_flag.assert_called_once_with(_MSG_ID), (
-        f"[ZIP-content-CLASH] expected flag; got {m_flag.call_args_list}"
+    m_flag.assert_not_called(), (
+        f"[ZIP-content-PDF_OVERRIDE] expected NO flag (Decision 01 trusts PDF); "
+        f"got {m_flag.call_args_list}"
     )
-    m_move.assert_not_called()
-    mgr_a = _manager_folder(tmp_path, "Sue Smith")
-    mgr_b = _manager_folder(tmp_path, "Bob Jones")
-    for mgr in (mgr_a, mgr_b):
-        assert not mgr.exists() or not list(mgr.iterdir()), (
-            f"[ZIP-content-CLASH] expected NO routed PDFs; found in {mgr}: "
-            f"{list(mgr.iterdir()) if mgr.exists() else []}"
-        )
-    unmatched = _unmatched_dir(tmp_path)
-    assert not unmatched.exists() or not list(unmatched.iterdir())
+    m_move.assert_called_once_with(_MSG_ID, _PROCESSED_FOLDER), (
+        f"[ZIP-content-PDF_OVERRIDE] expected move to processed; got {m_move.call_args_list}"
+    )
+    mgr_bob = _manager_folder(tmp_path, "Bob Jones")
+    routed = list(mgr_bob.iterdir()) if mgr_bob.exists() else []
+    assert len(routed) == 1, (
+        f"[ZIP-content-PDF_OVERRIDE] expected 1 PDF in Bob Jones folder (BCS 2800); "
+        f"got {[p.name for p in routed]}"
+    )
+    mgr_sue = _manager_folder(tmp_path, "Sue Smith")
+    assert not mgr_sue.exists() or not list(mgr_sue.iterdir()), (
+        f"[ZIP-content-PDF_OVERRIDE] Sue Smith (BCS 2707) should receive nothing; "
+        f"found {list(mgr_sue.iterdir()) if mgr_sue.exists() else []}"
+    )
 
 
 def test_subject_matched_zip_with_docx_flags_email(monkeypatch, tmp_path: Path) -> None:

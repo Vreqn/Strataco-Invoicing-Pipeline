@@ -11,6 +11,377 @@ Versioning: MAJOR.MINOR.PATCH
 
 
 ---------------------------------------------------------------------------
+0.19.0  —  2026-05-14  —  Step 7: new output layout + two Codex P2 bug fixes
+---------------------------------------------------------------------------
+
+Step 7 output layout change
+  Previously the aggregated summary lived in the plan-folder root and source
+  invoices were moved to Processed/{YYYY-MM}/. Both now land together in:
+
+    Strata_Plans/<plan>/Processed/{YYYY}/{MM} - {MonthName}/
+
+  For example: Processed/2026/04 - April/
+
+  The summary filename also drops the "Summary - " prefix:
+    Old: Summary - 04 - BCS1234 April 2026 inv.pdf
+    New: 04 - BCS1234 April 2026 inv.pdf
+
+  The {MM} - {MonthName} folder naming keeps months in chronological order in
+  Windows Explorer within the year folder.
+
+  Step 7 is scheduled to run on the 1st of each month (Task Scheduler).
+  The script still defaults to the previous calendar month when no --month flag
+  is given, so the first-to-last-day window is fully covered.
+
+  Changed files:
+  - tools/_lib/paths.py: strata_plan_processed_month now returns
+    Processed/{YYYY}/{MM} - {MonthName}/ (imports calendar)
+  - steps/step_7_aggregate.py: summary_path now points inside processed_dir;
+    _build_summary_name drops "Summary - " prefix; _summary_present
+    simplified to use summary_path.parent
+  - workflows/step_7_aggregate.md: all path/filename references updated
+  - tests/test_aggregate_filename.py: new-format summary rejection cases added
+  - tests/test_aggregation_ledger.py: summary_filename fixture updated
+
+P2 — safe_write_unique retry idempotency for collision variants (safe_io.py)
+  When a previous run wrote invoice (1).pdf (because invoice.pdf had different
+  content) and then failed before completing, a retry would see the existing (1)
+  file, skip it without comparing bytes, and write (2) — a spurious duplicate.
+  Fix: the collision-rename loop now checks each candidate for content equality
+  before incrementing the counter, matching the idempotency check that already
+  existed for the base path.
+
+P2 — processed_ok integrity check excluded the summary (step_7_aggregate.py)
+  After moving the summary into Processed/, the any(p.is_file()) check was
+  satisfied by the summary PDF alone. If source invoices had been deleted but
+  the summary remained, the run would record skipped_already_done instead of
+  surfacing the filesystem disagreement, hiding the missing source archive.
+  Fix: new _has_source_invoices(processed_dir, summary_path) helper (mirrors
+  _summary_present) excludes the summary and its safe_write_unique variants
+  from the count. processed_ok is now True only when at least one source
+  invoice is present.
+
+New tests:
+- tests/test_safe_io.py: test_safe_write_unique_retry_idempotent_on_collision_variant
+- tests/test_step7_helpers.py: 7 cases for _has_source_invoices (new file)
+
+---------------------------------------------------------------------------
+0.18.3  —  2026-05-14  —  Bug fixes: prior-path parity with self-attachments (P1 × 2)
+---------------------------------------------------------------------------
+
+Two P1 bugs in _process_prior_attachments (the reply-to-self recovery path) found by
+Codex review. Both were omissions — the self-attachment path was updated correctly in
+earlier releases; the prior path was not kept in sync.
+
+1. P1 — NO_PLAN boilerplate in a prior email is no longer misfiled.
+   When a prior email carried one real invoice (AGREE) plus a boilerplate PDF (NO_PLAN),
+   the prior-attachment loop routed every classification regardless, stamping and filing
+   the boilerplate as if it were an invoice. Fix: added the same NO_PLAN multi-PDF skip
+   guard that _process_self_attachments has since v0.18.0. When a NO_PLAN sibling is
+   skipped, the prior email is forwarded to the plan manager (also mirroring v0.18.0
+   behaviour) so they see the full original email.
+
+2. P1 — PDF_OVERRIDE in a prior email now routes to the PDF-identified plan.
+   When a prior PDF confidently identified Plan B while the corrected reply named Plan A,
+   the two-branch if/else in the routing loop ignored per_pdf_plan for ROUTE_AS_SUBJECT
+   actions, filing the invoice under Plan A. Fix: expanded to a three-branch if/elif/else
+   that checks idx in action.per_pdf_plan before falling back to plan_row, matching the
+   logic _process_self_attachments has used since v0.16.0.
+
+New tests:
+- test_step1_intake.py: test_prior_no_plan_skip_routes_invoice_not_boilerplate
+- test_step1_intake.py: test_prior_pdf_override_routes_to_pdf_plan
+
+---------------------------------------------------------------------------
+0.18.2  —  2026-05-14  —  Bug fixes: sweep racing new arrivals (P1); cross-day retry collision (P2)
+---------------------------------------------------------------------------
+
+Two bugs found by Codex review of the 0.16.0 Action_Required sweep feature:
+
+1. P1 — Sweep no longer races new arrivals (step_1_intake.py).
+   The end-of-run sweep re-fetches the live inbox. Any email arriving between
+   the initial fetch and the sweep was previously moved to Action_Required without
+   going through subject/PDF matching — permanently bypassed, since Step 1 only
+   reads the inbox root. Fix: the initial fetch now builds initial_inbox_ids; the
+   sweep re-fetches (so already-moved messages are naturally absent) but skips any
+   message not in that set, leaving new arrivals in the inbox root for the next run.
+
+2. P2 — Step 3 cross-day retry no longer creates a (1) collision copy (step_3_pdf_sort.py).
+   If the destination write succeeded but the ledger upsert failed, the source
+   stayed in _Unmatched/ for retry. On a later day, _today_received_str() returned
+   a new date; re-stamping produced different bytes; safe_write_unique saw a byte
+   mismatch and created a collision copy instead of returning the existing path.
+   Fix: dest is now computed before stamping. If dest already exists and its AcroForm
+   fields contain the deterministic gl_code_{sha[:16]} field name (proving it was
+   stamped from the same source), the existing bytes are reused — no re-stamp, no
+   byte drift, no collision. A different invoice at the same path (SHA mismatch)
+   still gets a fresh stamp so safe_write_unique correctly produces a collision copy.
+   stamp.py gains received_stamp_sha_matches() to support this check.
+
+New tests:
+- test_step1_intake.py: test_new_arrival_not_in_initial_ids_is_skipped
+- test_step3_true_move.py: test_step3_cross_day_retry_no_collision_copy
+
+---------------------------------------------------------------------------
+0.18.1  —  2026-05-14  —  Safety: forward-failure stays in inbox; Step 6 SHA verification
+---------------------------------------------------------------------------
+
+Two high-severity issues found via adversarial code review and fixed:
+
+1. Forward failure now flags the email and leaves it in the inbox.
+   Previously, if graph.forward_message() raised an exception (Graph API down,
+   network error, etc.) or was skipped due to a missing manager email, the code
+   still fell through to _email_destination(), which saw successfully-routed PDFs
+   and moved the email to processed_emails. The manager never received the extras;
+   the front desk had no visibility. Now: any forward failure sets forward_blocked,
+   calls _flag_message_safely(), and leaves target_folder_id = None so the email
+   stays in the Inbox with a red flag. Error is logged for the developer.
+
+2. Step 6 precheck now verifies archive SHA256 before unlinking the source.
+   Previously, when a source file reappeared and the ledger said it was already
+   archived, the code unlinked the source if Path(existing.archive_path).exists()
+   was True — no content check. A corrupted or replaced archive file would cause
+   the only good copy of the invoice to be deleted. Now the code reads the archive,
+   computes its SHA256, and compares against existing.archive_sha256 before allowing
+   unlink. Pre-0.12.1 ledger rows with no archive_sha256 recorded are treated as
+   unverifiable — the source is added to out.unmatched instead of being deleted.
+
+New tests:
+- test_step1_intake.py: test_forward_failure_flags_email_and_stays_in_inbox
+- test_step1_intake.py: test_missing_manager_email_flags_and_stays_in_inbox
+- test_step6_paid_archive.py: test_archive_sha_mismatch_does_not_unlink_source
+- test_step6_paid_archive.py: test_archive_sha_unverifiable_does_not_unlink_source
+
+---------------------------------------------------------------------------
+0.18.0  —  2026-05-14  —  Forward multi-attachment emails to manager (new protocol)
+---------------------------------------------------------------------------
+
+New behaviour from the ops team review: when Step 1 successfully processes an invoice
+email that also carries non-invoice attachments, it now forwards the full original email
+(all attachments intact) to the plan manager before moving it to processed_emails.
+
+What changed:
+- Multi-PDF emails with a NO_PLAN sibling (e.g. an FSC fuel surcharge notice stapled
+  to the invoice) no longer FLAG the inbox. The invoice PDF is stamped and filed as
+  usual; the no-plan PDF stays in the forwarded email for the manager to action.
+- Emails with non-PDF extras (a .docx contract, an .xlsx rate sheet, etc.) are now
+  also forwarded to the manager after the invoice is filed. Previously those extras
+  were silently discarded at intake.
+- The forwarded message uses Graph's /forward endpoint, preserving all original
+  attachments. The comment line names the strata plan and explains why it was forwarded.
+- After forwarding, the email moves to processed_emails (same as any clean route).
+  The inbox stays clean — no red flag, no manual review needed for the front desk.
+
+No change to flag behaviour for: AMBIGUOUS PDFs, CLASH, SUFFIX_VARIANT_COLLISION,
+download failures, invalid PDF bytes, unsafe ZIPs. Those still flag as before.
+
+New Graph API function: `graph.forward_message(message_id, to, comment)`.
+
+AUTO_SPLIT + extras (two distinct plans in same email + a non-invoice attachment):
+currently forwards to the first split manager only. Policy decision pending —
+see To-Speak-About.txt entry "2026-05-14 — AUTO_SPLIT + non-invoice extras".
+
+New test file: tests/test_step1_intake.py (15 tests — _decide_email_action pure-function
+coverage + _process_self_attachments forward-behavior mocks).
+
+
+---------------------------------------------------------------------------
+0.17.2  —  2026-05-14  —  Fix unsafe dest.exists() guards and Step 6 crash-gap collision
+---------------------------------------------------------------------------
+
+Three issues found by adversarial review of the 0.17.1 fix:
+
+[critical] Step 6 crash-gap recovery matched any archive file by filename alone. When one
+check number pays two different invoices for the same plan in the same month, both produce
+the same archive filename. The second invoice's source was deleted while the pre-existing
+archive (from the first invoice) was silently claimed for it — data loss.
+Fix: `flatten_acroform` is now called before the crash-gap scan. The scan verifies by
+content-SHA (`sha256(candidate.read_bytes()) == archive_sha`) instead of filename. A
+content-SHA mismatch means the existing file belongs to a different invoice and crash-gap
+does not fire; `safe_write_unique` creates a `(1)` collision copy.
+
+[high] Step 3's `dest.exists()` guard (added in 0.17.1) unconditionally reused any file at
+the target path, including one written by a prior, unrelated invoice with the same sanitised
+filename — silent data loss for the second invoice.
+
+[high] Step 5 had the same unsafe guard for the AP `ap_dest.exists()` path.
+
+Root fix: stamp output is now deterministic for the same source SHA.
+- `_stamp_id(seed)` in `stamp.py` uses `sha[:16]` as the AcroForm field-name seed when a
+  SHA is supplied; falls back to `time.time()` for callers that don't pass one (backwards-
+  compatible).
+- `flatten_acroform` now saves with `deterministic_id=True` (pikepdf), making flattened
+  bytes byte-for-byte identical across retries for the same input.
+- Steps 3 and 5 pass `sha=sha` to their stamp calls, so re-stamped bytes on retry are
+  identical to the first attempt.
+- `safe_write_unique` gains a content-idempotency check: if the destination exists and its
+  bytes match `data`, it returns the existing path without writing. This replaces the unsafe
+  `dest.exists()` shortcut: identical bytes → idempotent return; different bytes → collision
+  copy, no data loss.
+
+New and updated tests:
+- `test_stamp_determinism_with_sha_seed` (test_stamp.py) — gate test; must pass before ship.
+- `test_step3_different_invoice_same_dest_gets_collision_copy` (test_step3_true_move.py, test 6)
+- `test_step5_different_invoice_same_dest_gets_collision_copy` (test_step5_true_move.py, test 6)
+- test_step6_paid_archive.py test 3 updated to use real flattened bytes for content-SHA.
+- `test_step6_filename_collision_two_invoices_both_archived` (test_step6_paid_archive.py, test 9)
+
+---------------------------------------------------------------------------
+0.17.1  —  2026-05-14  —  Fix retry-after-ledger-failure collision copy in Steps 3 and 5
+---------------------------------------------------------------------------
+
+Bug: when the ledger upsert fails after a successful destination write (fail-closed
+behaviour), the source PDF stays in its folder for retry. On the next run the duplicate
+check finds no ledger entry, so it proceeds past the guard. Because `_stamp_id()` uses
+`time.time()`, the re-stamped bytes differ from the first attempt, and `safe_write_unique`
+sees the destination occupied and creates a `(1)` collision copy. After a successful
+ledger upsert, two copies of the same invoice resided in the destination folder.
+
+Fix: in `_route_one` (Step 3) and `_transfer_one` (Step 5), before calling
+`safe_write_unique`, check if the intended destination already exists. If it does, re-use
+it (the write phase already completed) and proceed directly to the ledger upsert. The
+collision copy is never created.
+
+Two new regression tests added — `test_step3_ledger_failure_retry_no_collision_copy` and
+`test_step5_ledger_failure_retry_no_collision_copy` — that confirm the fix by running the
+two-phase scenario (ledger-fail run 1, clean run 2) and asserting exactly one file in
+the destination after both runs.
+
+---------------------------------------------------------------------------
+0.17.0  —  2026-05-14  —  True-move for Steps 3, 5, and 6; fail-closed ledger
+                          writes; no Processed- markers
+---------------------------------------------------------------------------
+
+Steps 3, 5, and 6 previously used copy-then-delete with a `Processed -`
+marker file written back to the source folder as a filename-based dedup
+flag. After a run, source folders accumulated full-PDF duplicate copies
+that were never cleaned up. Dedup already lived in the dup ledger (SHA-256);
+the markers were redundant and confusing.
+
+0.17.0 converts all three steps to a true move:
+
+  1. Write the destination.
+  2. Update the dup ledger.
+  3. Delete the source.
+
+No `Processed -` or `Processed-YYYYMMDD-*` file is written back to any
+source folder. The ledger is the sole dedup authority.
+
+Additionally, all three steps are now fail-closed on ledger writes: if the
+ledger update fails after a successful destination write, the source is left
+in place for retry on the next run. In the old code, Steps 3 and 5
+performed the ledger update BEFORE the destination write (fail-open) — a
+crash between the two steps would advance the ledger stage without an
+on-disk destination. That ordering bug is corrected here.
+
+Crash-gap recovery (Step 6): if a prior run wrote the archive but died
+before the ledger update, the next run detects the on-disk archive via a
+physical stem-match scan, heals the ledger row, and deletes the source —
+no manual intervention required.
+
+Changes by step:
+
+  Step 3 (`steps/step_3_pdf_sort.py`):
+  - Extracted `_route_one()` as a standalone testable function.
+  - Deleted `_now_stamp()` (used only for marker naming).
+  - Fail-closed: ledger upsert failure leaves source in `_Unmatched/` for retry.
+  - Duplicate path: `increment_dup_count` → unlink source. No
+    `Processed-YYYYMMDD-HHMMSS-DUPLICATE-<name>` marker.
+
+  Step 5 (`steps/step_5_to_ap.py`):
+  - Extracted `_transfer_one()` as a standalone testable function.
+  - Fail-closed: ledger update moved to AFTER destination write; failure
+    leaves source in `Manager/Approved/` for retry.
+  - Duplicate path: `increment_dup_count` → unlink source. No
+    `Processed - DUPLICATE - <name>` marker.
+
+  Step 6 (`steps/step_6_paid_archive.py`):
+  - Deleted `_processed_counterpart()` helper and the marker-write block.
+  - Deleted marker-based dedup reconcile from `main()` loop.
+  - Fail-closed: ledger update failure leaves source in `Paid_Invoices/`
+    for retry; archive is still on disk.
+  - Crash-gap recovery: physical stem-match detects existing archive when
+    ledger row is missing; heals ledger and removes source.
+
+Tests added:
+  - `tests/test_step3_true_move.py` — 4 cases (true move, retry, fail-closed,
+    duplicate no marker).
+  - `tests/test_step5_true_move.py` — 4 cases (mirror of Step 3 pattern,
+    adapted for `ap_queue` stage and `Manager/Approved/` folder).
+  - `tests/test_step6_paid_archive.py` — 8 cases (all paths including
+    crash-gap recovery and ledger-says-archived-but-file-missing).
+
+Legacy `Processed -` files already on disk are skipped by the existing
+`_is_processed()` guards in each step — no breakage. See To-Speak-About.txt
+for cleanup options.
+
+
+---------------------------------------------------------------------------
+0.16.0  —  2026-05-14  —  Paid stamp shows its date format; Step 6 ignores OS
+                          junk files; diagnostic reports real lock state
+---------------------------------------------------------------------------
+
+A 2026-05-14 Step 6 run reported "3 errors" against two paid invoices. A
+diagnostic bundle showed the three were unrelated, and only one was a
+code bug:
+
+  1. unmatched_intake: .DS_Store — a macOS metadata file had sat in
+     _Unmatched/Invoices/ since 2026-03-12. Step 6's intake scan had no
+     junk filter, so it surfaced .DS_Store as a "stuck file" on EVERY
+     run — pure noise that inflated the error count and the morning
+     email. It never blocked an invoice.
+
+  2. NWS 179 "Could not read Date from Paid stamp" — the Paid stamp's
+     Date field contained the literal text "ABC". parse_paid_date
+     correctly rejected it. Working as designed; the systemic cause is
+     that the stamp gave no indication of the expected date format.
+
+  3. VR 115 "PDF appears image-only" — that invoice was produced via
+     Microsoft "Print to PDF" (rasterised, no AcroForm). Known failure
+     mode; recovery is to re-save from Acrobat with Ctrl+S.
+
+Separately, the bundle claimed all five step lockfiles were HELD even
+though every step had finished cleanly — a false alarm.
+
+Changes:
+
+  - Step 6 intake scan now filters OS-generated metadata files —
+    scoped to exactly .DS_Store, AppleDouble ._* sidecars, Thumbs.db,
+    and desktop.ini. They are skipped, not deleted. The filter is NOT a
+    blanket dotfile filter: a genuinely stuck intake file that happens
+    to be dot-hidden still surfaces in the morning report.
+    (steps/step_6_paid_archive.py: _is_os_junk)
+
+  - The Paid stamp now prints a small grey caption — "format:  MMM DD
+    YYYY" — in the PAID title band, so whoever fills the stamp knows the
+    expected date format. The month-name format is genuinely unambiguous
+    and is already what parse_paid_date treats as the default, so the
+    date reader is unchanged. The caption sits OFF every field's read
+    baseline and carries no date/check tokens or digits, so no extractor
+    tier can mistake it for a value. (tools/_lib/stamp.py)
+
+  - collect_diagnostics.py now probes the ACTUAL lock state instead of
+    checking file existence. A .step_N.lock file persists on disk after
+    a run (portalocker releases the OS lock but does not unlink the
+    file); the bundler now does a non-blocking acquire to tell a stale
+    leftover file apart from a genuinely-held lock. (_lock_is_held)
+
+  - daily_log() now acquires its per-step lock with a bounded retry
+    (LOCK_ACQUIRE_TIMEOUT_S = 3.0, checked every 0.25s) instead of
+    failing instantly on the first collision. A momentary collision —
+    the diagnostic lock probe above, or two steps briefly racing at
+    startup — resolves within the window instead of forcing a spurious
+    "skipped" run; a genuinely-running prior step holds its lock for its
+    whole duration and still skips. (tools/_lib/log.py)
+
+Not code changes — operator actions for the two stuck invoices:
+  - NWS 179: re-open in Acrobat, put a real date in the Date field
+    (MMM DD YYYY format — the new caption now shows this), Ctrl+S, re-run
+    Step 6.
+  - VR 115: re-save from Acrobat with Ctrl+S, not "Print to PDF".
+
+
+---------------------------------------------------------------------------
 0.15.2  —  2026-05-14  —  Multi-PDF emails with a plan-less sibling are held,
                           not auto-routed (0.15.0 regression fix)
 ---------------------------------------------------------------------------

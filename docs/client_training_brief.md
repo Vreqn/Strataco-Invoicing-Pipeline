@@ -89,7 +89,7 @@ Once a month, it also bundles each plan's paid invoices into a single **Monthly 
 
 **What the Accountant does:**
 1. Open the invoice in Adobe Acrobat from your `Approved_Invoices` folder.
-2. Fill in the **Date** and **Check Number** fields on the blue Paid stamp.
+2. Fill in the **Date** and **Check Number** fields on the blue Paid stamp. The stamp shows the expected date format right under the "PAID" heading — `format:  MMM DD YYYY` — so enter the date with the month spelled out, e.g. `MAY 08 2026`.
 3. Save with **Ctrl+S** (regular save — do NOT use Print-to-PDF or Export-as-PDF; Step 6 handles flattening).
 4. Drag the file to your `Paid_Invoices` folder.
 
@@ -104,7 +104,7 @@ Once a month, it also bundles each plan's paid invoices into a single **Monthly 
 
 **What you do:** Nothing.
 
-**Watch for:** If the morning "Invoices summary" email lists your file under the **Action Required → Paid invoices stuck** section, the Paid stamp's Date or Check Number fields are probably blank. Open the PDF, fill them in, Ctrl+S, and the next morning's run picks it up.
+**Watch for:** If the morning "Invoices summary" email lists your file under the **Action Required → Paid invoices stuck** section, the Paid stamp's Date or Check Number field is probably blank — or the Date field has something that isn't a real date. Open the PDF, fill them in (date as `MMM DD YYYY`, e.g. `MAY 08 2026`), Ctrl+S, and the next morning's run picks it up.
 
 ---
 
